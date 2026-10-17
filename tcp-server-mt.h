@@ -318,7 +318,10 @@ private:
     void teardownClosed(Conn* c, const char* reason, bool graceful) noexcept;
     void parkClose(Conn* c, const char* reason) noexcept;
     bool tryBeginWriteShutdown(Conn* c) noexcept;
-    void finishPeerClosed(Conn* c, bool inputDrained) noexcept;
+    // Precondition: parseFrames has already drained every complete frame, so any
+    // reply it triggered is queued ahead of the FIN this may send. handleRead
+    // establishes that before calling in; it is not checked here.
+    void finishPeerClosed(Conn* c) noexcept;
     void unregisterConn(Conn* c, bool graceful = true) noexcept;
     void discardPendingOutput(Conn* c) noexcept;
     void finishClose(std::shared_ptr<Conn>& c) noexcept;
@@ -869,7 +872,18 @@ inline void SubReactor::handleRead(Conn* c) noexcept {
             // go out once wbuf drains.
             parseFrames(c, framesLeft);
             if (c->isClosed.load(std::memory_order_acquire)) return;
-            finishPeerClosed(c, framesLeft == 0);
+            if (framesLeft <= 0) {
+                // Budget spent with bytes still buffered: complete frames are
+                // waiting whose handler has not run, and their replies have not
+                // been queued yet. Sending a FIN now would put it ahead of them,
+                // and this branch returns without re-arming -- so unless the read
+                // goes back on the list nothing will ever finish this connection.
+                // Re-entering lands back here with a fresh budget and no pending
+                // frames, which is where the teardown actually happens.
+                scheduleRead(c);
+                return;
+            }
+            finishPeerClosed(c);
             return;
         } else {
             if (errno == EINTR) continue;
@@ -914,15 +928,21 @@ inline bool SubReactor::tryBeginWriteShutdown(Conn* c) noexcept {
     return true;
 }
 
-// The peer has finished sending (recv returned 0, or a zero-byte read surfaced
-// through the deferred path). `inputDrained` says parseFrames can make no further
-// progress, which is the precondition for answering with a FIN: any complete
-// frame still buffered is a request that has been served but whose reply has not
-// been queued yet (the handler runs from rbuf, so those frames are not lost --
-// but FIN-ing first would make the queued reply illegal to write).
-inline void SubReactor::finishPeerClosed(Conn* c, bool inputDrained) noexcept {
+// The peer has finished sending (recv returned 0). Callers reach this only once
+// handleRead has established that no complete frame is left unprocessed -- every
+// request has run its handler, so anything those handlers queued is already in
+// wbuf and FIN-ing after it is safe. FIN-ing ahead of a queued reply is what this
+// ordering exists to prevent: the write would either be refused by the kernel or
+// silently lost, and the peer would see a clean end to a truncated stream.
+//
+// This is also the last chance to end the connection. Until it ran, an EOF with
+// nothing else outstanding left the socket registered and idle: the read event
+// had already fired, so nothing was going to fire again, and the connection sat
+// in conns_ until doTick's linger deadline reached it -- which aborts, because a
+// deadline is all it can be sure of. Every half-close initiated by the peer paid
+// for that with an RST it never earned (P0-5).
+inline void SubReactor::finishPeerClosed(Conn* c) noexcept {
     if (c->isClosed.load(std::memory_order_acquire)) return;
-    if (!inputDrained) return;          // the read continuation calls us again
     if (!c->wbuf.empty()) return;       // parked close finishes in handleWrite
     if (c->closing && !c->finSent) {
         // Still closing on our side and the peer declared itself done too: the
