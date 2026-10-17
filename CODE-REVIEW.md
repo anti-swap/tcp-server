@@ -115,14 +115,14 @@
   - 语义变化：`pendingBytes` 从此只承担限流职责，`wbuf` 是写调度的唯一真相源（与"全帧原子写入"的不变量一致）。
 - **附**：`submitSend` / PING 分支都运行在 reactor 线程上，`arm` 与 `disarm` 的调用点因此**全部串行**（`processPending` 与 `handleWrite` 都在同一 loop 里），所以 `writeArmed` 用普通 `bool` 而非原子量是安全的——这一点已写进 `Conn` 字段注释。
 
-### [P1-2] 关闭连接时 `wbuf` 中被丢弃的字节未回退 `pendingBytes` → 发送队列水位只增不减
+### [P1-2] 关闭连接时 `wbuf` 中被丢弃的字节未回退 `pendingBytes` → 发送队列水位只增不减　✅ 已修复（commit 3db4521）
 
 - **位置**：`drainWbufToSocket` L673 只扣已发送字节；`closeConn` L789-816 未处理残留
 - **缺陷模式**：D-06 错误吞没（同类：状态泄漏）
 - **机理**：`pendingBytes` 在**入队时**加、在**发送成功时**减。连接中途断开时，`wbuf` 里剩余 N 字节永远不会发出去，`drainWbufToSocket` 也不会再被调用，于是这 N 字节永远挂在计数器上。对**该连接**无害（对象即将销毁），但：
   - `stats.queueDrops` 会把"关闭丢弃"和"过载拒绝"混在一起，运维无法区分"对端太慢" vs "我方掉线"；
   - 若将来把 `pendingBytes` 提升为**全局**水位（很自然的下一步），这个泄漏会直接变成"内存永不满、写侧永久限流"。
-- **建议**：`closeConn` 在 `c->fd` 关闭后补一行：
+- **建议（原方案）**：`closeConn` 在 `c->fd` 关闭后补一行：
   ```cpp
   const size_t dropped = c->wbuf.readable();
   if (dropped) { c->pendingBytes.fetch_sub(dropped, std::memory_order_relaxed);
@@ -130,6 +130,11 @@
   c->wbuf.clear();
   ```
   并新增独立计数 `bytesDropped`（不要把关闭丢弃塞进 `queueDrops`）。
+- **已落地（commit `3db4521`）**：
+  - 新增 `discardPendingOutput(Conn*)`：`wbuf.clear()` + `pendingBytes -= wbuf.readable()` + `bytesDropped += 同上`，在 `closeConn()` 摘 fd **之前**调用（关闭回调读统计时已能看见）。
+  - 新增 `ServerStats::bytesDropped`，把"关闭丢弃"从 `queueDrops` 中分离。
+  - **刻意不处理的边界**：任务已占额但尚未写入 wbuf 的字节由 `submitSend` 的 `isClosed` 分支自行回退——两处账目互斥，避免双减。这一点写在 `discardPendingOutput` 的注释里，避免后来者"补全"造成重复扣减。
+  - **与 P1-1 的关联**：`pendingBytes` 在 P1-1 之后已退出写调度，只作限流计数；这条修复让它重新满足"入队 +size / 发送 −k / 关闭 −剩余"的三段式语义，为将来的全局水位统计打好底。
 
 ### [P1-3] 连接的"成功语义"与统计口径相反：`accepted` 在入队时 +1，实际 `rejected` 发生在 reactor 线程
 
