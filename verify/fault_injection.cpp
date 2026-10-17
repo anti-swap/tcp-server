@@ -16,6 +16,9 @@
 //   C. Injecting across repeated restarts -- anything that claims a failed worker
 //      is recoverable has to survive being restarted after one died, because that
 //      is the only shape "recoverable" can take that anyone would rely on.
+//   D. closeLingerMs <= 0 must be refused at start(): doTick only sweeps a parked
+//      close when linger > 0, so a non-positive value turns every peer that never
+//      answers our FIN into a permanent fd + admission leak.
 //
 // Build (Linux only), one line, so nothing here can be copied wrong:
 //   g++ -std=c++17 -Wall -Wextra -pthread -DINDUSTRIAL_TCP_TESTING verify/fault_injection.cpp -o fault_injection
@@ -200,6 +203,27 @@ int main() {
         }
         expect(usableAgain == 12, "every round left a server that could start again");
         std::printf("      completed %d of 12 rounds\n", usableAgain);
+    }
+
+    // ---- D: a configuration that cannot be honoured is refused --------------
+    {
+        std::printf("D. closeLingerMs <= 0 is refused at start()\n");
+        MultiReactorServer::Config cfg = base;
+        cfg.port = pickPort();
+
+        cfg.closeLingerMs = 0;
+        MultiReactorServer server0(cfg);
+        expect(!server0.start(), "closeLingerMs=0 refused");
+        expect(!server0.isRunning(), "a refused start leaves the server stopped");
+
+        cfg.closeLingerMs = -1;
+        MultiReactorServer serverNeg(cfg);
+        expect(!serverNeg.start(), "closeLingerMs=-1 refused");
+
+        cfg.closeLingerMs = 1;
+        MultiReactorServer serverOk(cfg);
+        expect(serverOk.start(), "closeLingerMs=1 still accepted");
+        if (serverOk.isRunning()) serverOk.stop();
     }
 
     std::printf("%s (%d failure%s)\n", gFailures == 0 ? "ALL PASS" : "FAILURES",
