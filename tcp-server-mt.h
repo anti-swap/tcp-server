@@ -283,7 +283,7 @@ private:
     void closeConn(Conn* c, const char* reason) noexcept;
     void unregisterConn(Conn* c) noexcept;
     void discardPendingOutput(Conn* c) noexcept;
-    void finishClose(const std::shared_ptr<Conn>& c) noexcept;
+    void finishClose(std::shared_ptr<Conn>& c) noexcept;
     void flushCloseCallbacks() noexcept;
     void armWrite(Conn* c) noexcept;
     void disarmWrite(Conn* c) noexcept;
@@ -954,7 +954,9 @@ inline void SubReactor::closeConn(Conn* c, const char* reason) noexcept {
 
 // Release our reference before running the callbacks: after this the connection
 // may be fully destroyed, which is exactly the state a deferred callback expects.
-inline void SubReactor::finishClose(const std::shared_ptr<Conn>& c) noexcept {
+// Takes a mutable reference on purpose: reset() cannot be called through const,
+// and the caller's slot must be emptied rather than merely read.
+inline void SubReactor::finishClose(std::shared_ptr<Conn>& c) noexcept {
     c.reset();
 }
 
