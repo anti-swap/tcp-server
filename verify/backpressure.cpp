@@ -100,6 +100,8 @@ int main() {
 
     std::printf("A. one reactor has to be able to queue one round of replies\n");
 
+    // ---- A: one round of replies has to fit in one reactor's queue ----------
+    {
     MultiReactorServer::Config cfg;
     cfg.bindAddr = "127.0.0.1";
     cfg.port = pickPort();
@@ -161,6 +163,70 @@ int main() {
 
     server.stop();
     ::close(cfd);
+    }
+
+    // ---- B: a close the queue refuses must say so ---------------------------
+    //
+    // Same construction as A (one held worker, everything else raised out of
+    // reach) but asked to close instead of send: with the queue full, enqueue
+    // refuses, and until that is counted nothing anywhere records that this
+    // connection was ever asked to go away -- it just waits for idle timeout.
+    {
+        std::printf("B. a close the queue refuses is countable\n");
+
+        MultiReactorServer::Config bcfg;
+        bcfg.bindAddr = "127.0.0.1";
+        bcfg.port = pickPort();
+        bcfg.numReactors = 1;
+        // Same reasoning as case A: neither per-connection limit may be the
+        // thing refusing anything here, so both are out of reach.
+        bcfg.maxPendingBytes = 8u << 20;
+        bcfg.wbufCapacity    = 8u << 20;
+
+        MultiReactorServer server(bcfg);
+
+        std::atomic<bool>     release{false};
+        std::atomic<uint64_t> connId{0};
+        std::atomic<bool>     reachedCb{false};
+
+        server.setConnStateHandler([&](uint64_t id, const std::string&, bool up) {
+            if (!up) return;
+            connId.store(id, std::memory_order_release);
+            reachedCb.store(true, std::memory_order_release);
+            for (int i = 0; i < 20000 && !release.load(std::memory_order_acquire); ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        });
+
+        expect(server.start(), "start() ok");
+        int cfd = connectTo(bcfg.port);
+        expect(cfd >= 0, "client connected");
+        expect(waitFor(5000, [&] { return reachedCb.load(std::memory_order_acquire); }),
+               "the worker reached the open callback");
+
+        // Fill past the queue cap: with one reactor and maxConnections at its
+        // default the cap is 4 * maxConnections, so nothing below 40000 tasks
+        // can make enqueue refuse. Nothing is draining any of it.
+        int refused = 0;
+        for (int i = 0; i < 45000; ++i) {
+            const uint64_t id = connId.load(std::memory_order_acquire);
+            if (server.sendTo(id, "\x01", 1) != SendResult::Ok) ++refused;
+        }
+        std::printf("      queue refused %d of 45000 sends\n", refused);
+        expect(refused > 0, "the queue cap actually refused frames");
+
+        const uint64_t before = server.stats().closeRequestsDropped.load();
+        server.closeConnection(connId.load(std::memory_order_acquire));
+        std::printf("      closeRequestsDropped +%llu\n",
+                    (unsigned long long)(server.stats().closeRequestsDropped.load()
+                                         - before));
+        expect(server.stats().closeRequestsDropped.load() > before,
+               "a close the queue refused is counted, not swallowed");
+
+        release.store(true, std::memory_order_release);
+        server.stop();
+        ::close(cfd);
+    }
 
     std::printf("%s (%d failure%s)\n", gFailures == 0 ? "ALL PASS" : "FAILURES",
                 gFailures, gFailures == 1 ? "" : "s");

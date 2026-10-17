@@ -238,6 +238,9 @@ struct ServerStats {
     // 下会让 epoll_wait 每次都立即返回同一个 EPOLLIN，所以这个数字同时是
     // "reactor 是否在对着同一个 FIN 空转"的探针：停靠排空期间它应几乎不动。
     std::atomic<uint64_t> eofReads{0};
+    // closeConnection() 发出去的 Submission 被队列拒绝的次数。这些关闭请求既
+    // 没有落到连接上，也没有任何计数器记账，唯一的下场是等 idle 超时。
+    std::atomic<uint64_t> closeRequestsDropped{0};
 };
 
 // ==================== 发送结果 ====================
