@@ -149,7 +149,7 @@
   - `onConnectionOpened` 失败分支补上 `epoll_ctl(DEL)`（通过新抽出的 `unregisterConn()`），并补 `rejected++`。
   - 结果：`accepted` 与 `rejected` 互斥，`accepted - closed == 在线连接数` 重新成立。
 
-### [P1-4] 优雅关闭未 `shutdown(SHUT_WR)`：业务应答可能被丢弃；错误路径还直接 RST　✅ 已修复（commit 待填）
+### [P1-4] 优雅关闭未 `shutdown(SHUT_WR)`：业务应答可能被丢弃；错误路径还直接 RST　✅ 已修复（commit 378183f）
 
 - **位置**：`closeConn`（原 L802-807，`epoll_ctl(DEL)` 紧接 `::close`）
 - **缺陷模式**：D-02 上下文丢失（协议层语义）
@@ -160,7 +160,7 @@
   - 新增 `SendResult`/状态：`ShutdownWrite`（只 `shutdown(fd, SHUT_WR)`，保留读侧排空、等 `EPOLLIN` 读到 EOF 再 close）；
   - `closeConn` 增加 `bool graceful` 形参：graceful 路径先 `discard rbuf` → `flush wbuf`（尽力而为）→ `shutdown(SHUT_WR)` → 标记 `halfClosed`，等对端 FIN 或 5s 超时再真正 close；
   - 非 graceful 路径（bad magic / 帧过大 / 安全原因）才允许直接 close，并在 close 前 `setsockopt(SO_LINGER{1,0})` 让 RST 语义显式化，而不是碰运气。
-- **已落地（commit 待填）**：
+- **已落地（commit `378183f`）**：
   - **关闭分两条路**：`closeConn(c, reason, graceful = true)`。默认 graceful（业务 `closeConnection`、对端 FIN、空闲超时），协议违规/资源耗尽/故障路径显式传 `false`（`bad magic`、`frame too large`、`rbuf full`、`recv error`、`send error`、`epoll ctl` 失败、`hup/err`、`wbuf full on pong`、`scratch too small`、`close linger expired`、`server shutdown`）。
   - **新增 `Conn::closing` / `Conn::finSent` 两个状态位**，与 `isClosed` 分离——这是这条修复的核心：
     - `closing`：graceful 关闭已受理但 socket 还在。`submitSend` 与 PING 分支拒收新帧（否则会排到 FIN 之后），**但已入队的应答仍然入 wbuf**（`submitClose` 只标记 + 返回，回到 `processPending` 后同批次的 `sendTo` 任务先跑）。
@@ -272,7 +272,7 @@
 | P1-2 | 关闭时 wbuf 残留不回退 `pendingBytes` | ✅ | `3db4521` |
 | P1-3 | `accepted` 计数口径与 `rejected` 冲突 | ✅ | `bcd2ead` |
 | P2-1 | 注册失败回滚不完整 | ✅ | `bcd2ead` |
-| P1-4 | 缺 `shutdown(SHUT_WR)` 优雅关闭 | ✅ | 见下 |
+| P1-4 | 缺 `shutdown(SHUT_WR)` 优雅关闭 | ✅ | `378183f` |
 | P1-5 | 无测试、故障注入开关无消费者 | ⬜ 待做 | — |
 | P2-2 | `sendTo` 双锁 + `pendingBytes` 内存序论证不成立 | ⬜ 待做 | — |
 | P2-3 | rlimit 只告警不动作 | ⬜ 待做 | — |

@@ -40,6 +40,33 @@ g++ -std=c++17 -Wall -Wextra -g -fsanitize=address,undefined \
 添加时用注入法验证过：往头文件里插一个未声明标识符 → 报出精确行号并 exit 1；
 移除后 → exit 0。不做这一步的话，「通过」这个结论本身就没有意义。
 
+**2026-10-17 重新验证时踩到同一个坑的第二种形态**：把探针追加到文件**末尾**（`} // namespace industrial`
+之后）时，`build.sh` 依然报 OK。原因不是编译器，而是探针在命名空间外部、又只被 `inline`
+修饰——没有调用者就不会生成代码，语法与名字查找都没被触发。**注入必须在命名空间内部，
+且最好直接在已有函数体里引用未声明符号**，否则会得到另一个假阴性。
+
+## close_semantics.cpp —— 唯一一个真正的运行时测试
+
+`close_semantics.cpp` 与 `compile_check.cpp` 不同：它断言的是**线上可见的行为**，编译器看不见。
+
+```bash
+# 只能在 Linux 上跑
+g++ -std=c++17 -Wall -Wextra -pthread verify/close_semantics.cpp -o close_semantics && ./close_semantics
+```
+
+四个用例（对应 P1-4）：
+
+| 用例 | 断言 |
+|------|------|
+| A | `sendTo` 应答 + `closeConnection`（"先答再挂"）→ 应答完整收到，结束于 FIN 而非 RST |
+| B | 关闭时客户端仍有未读请求 → 不得退化为 RST |
+| C | 坏 magic → 对端观察到 RST，`parseErrors` / `aborted` 计数 |
+| D | `accepted == closed`，无连接泄漏 |
+
+`build.sh` 会**编译**（不链接、不运行）这个文件，用于捕捉公开接口漂移——例如 `closeConnection`
+改名这类 `compile_check.cpp` 完全发现不了的问题。为此还需要 `stub/posix_shim.h` 提供
+`sockaddr_in` / `htons` / `send` / `getsockname` / `SO_RCVTIMEO` 等测试端要用的声明。
+
 ## stub 的边界
 
 `stub/posix_shim.h` 只声明类型和函数原型，不提供实现。刻意保守：
