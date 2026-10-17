@@ -28,6 +28,7 @@
 #include <atomic>
 #include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -149,6 +150,33 @@ bool waitFor(int ms, const std::function<bool()>& pred) {
     return pred();
 }
 
+// Every counter, dumped as one line per phase. The whole point is to be able to
+// read a failure off the deltas: accepted/rejected says whether the accept loop
+// handed the connection over, queueDrops says whether the reactor refused the
+// task, epollCtlErrors/rejected inside registers say whether the reactor took it
+// and then dropped it, and reactorFailures says whether the worker is still
+// alive at all. Any one of those three looks identical from the client side.
+void dumpStats(MultiReactorServer& server, const char* phase) {
+    auto& st = server.stats();
+    std::printf("    [%s] conns=%zu run=%d acc=%llu rej=%llu cls=%llu abt=%llu "
+                "perr=%llu qdrop=%llu ctl=%llu rfail=%llu tasks=%llu depth=%llu "
+                "frecv=%llu fsent=%llu\n",
+                phase,
+                server.connectionCount(), (int)server.isRunning(),
+                (unsigned long long)st.accepted.load(),
+                (unsigned long long)st.rejected.load(),
+                (unsigned long long)st.closed.load(),
+                (unsigned long long)st.aborted.load(),
+                (unsigned long long)st.parseErrors.load(),
+                (unsigned long long)st.queueDrops.load(),
+                (unsigned long long)st.epollCtlErrors.load(),
+                (unsigned long long)st.reactorFailures.load(),
+                (unsigned long long)st.pendingTasksTotal.load(),
+                (unsigned long long)st.pendingTasksDepth.load(),
+                (unsigned long long)st.framesRecv.load(),
+                (unsigned long long)st.framesSent.load());
+}
+
 }  // namespace
 
 int main() {
@@ -168,6 +196,10 @@ int main() {
     cfg.port = pickPort();
     cfg.bindAddr = "127.0.0.1";
     cfg.numReactors = 2;
+    // Switchable because pickReactor() hands connections out round-robin: with
+    // CS_REACTORS=1 every client lands on the same reactor, so a fault that
+    // belongs to one worker and not another shows up as everything passing.
+    if (const char* r = std::getenv("CS_REACTORS")) cfg.numReactors = std::atoi(r);
     cfg.closeLingerMs = 300;          // keep the test short
     std::printf("== target port: %u, bindAddr=%s, reactors=%d ==\n",
                 (unsigned)cfg.port, cfg.bindAddr.c_str(), cfg.numReactors);
@@ -204,11 +236,14 @@ int main() {
                     (unsigned)cfg.port);
     }
 
+    dumpStats(server, "started");
+
     const uint16_t port = cfg.port;
 
     // ---- A: reply queued, then close (answer-then-hang-up) -----------------
     {
         std::printf("A. reply + close\n");
+        dumpStats(server, "A.begin");
         int fd = connectTo(port);
         expect(fd >= 0, "client connected");
         replyQueued.store(false);
@@ -231,11 +266,13 @@ int main() {
         }
         expect(waitFor(2000, [&] { return server.connectionCount() == size_t(0); }),
                "connection torn down after the FIN exchange");
+        dumpStats(server, "A.end");
     }
 
     // ---- B: close while the client still has data unread -------------------
     {
         std::printf("B. close with request in flight\n");
+        dumpStats(server, "B.begin");
         int fd = connectTo(port);
         expect(fd >= 0, "client connected");
         // Two complete requests, then close immediately: the second one may still
@@ -247,6 +284,8 @@ int main() {
                    id = ids.front();
                    return true;
                }), "connection id observed");
+        std::printf("      observed id=%llu (0 means the wait never saw one)\n",
+                    (unsigned long long)id);
 
         sendAll(fd, encode(FrameType::DATA, "one", 3));
         sendAll(fd, encode(FrameType::DATA, "two", 3));
@@ -257,11 +296,13 @@ int main() {
         ::close(fd);
         expect(!reset, "close did not degenerate into RST");
         expect(!got.empty(), "at least the first reply was delivered");
+        dumpStats(server, "B.end");
     }
 
     // ---- C: protocol violation must be an explicit abort -------------------
     {
         std::printf("C. bad magic -> abort\n");
+        dumpStats(server, "C.begin");
         int fd = connectTo(port);
         expect(fd >= 0, "client connected");
         uint8_t junk[16];
@@ -276,12 +317,14 @@ int main() {
                "parseErrors counted");
         expect(waitFor(2000, [&] { return server.stats().aborted.load() >= 1; }),
                "aborted counted");
+        dumpStats(server, "C.end");
     }
 
     // ---- D: accounting ------------------------------------------------------
     {
         std::printf("D. accounting\n");
         server.stop();
+        dumpStats(server, "D.stopped");
         const auto& st = server.stats();
         expect(st.accepted.load() == st.closed.load(),
                "accepted == closed after all connections ended");

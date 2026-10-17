@@ -40,17 +40,38 @@ fi
 g++ "${CXXFLAGS[@]}" verify/close_semantics.cpp -o /tmp/close_semantics
 
 # ---- run ------------------------------------------------------------------
-echo "== running =="
-/tmp/close_semantics
-rc=$?
+# Both reactor counts: pickReactor() hands connections out round-robin, so with
+# more than one worker a fault that belongs to a single reactor gets averaged
+# away. CS_REACTORS=1 puts every client on one worker and makes that visible.
+run_once() {
+    local rc=0
+    "$@" || rc=$?      # no set -e here: the exit code is the result, not a trap
+    return "$rc"
+}
+
+echo "== running (default: 2 reactors) =="
+run_once /tmp/close_semantics
+rc_default=$?
+
+echo
+echo "== running again with CS_REACTORS=1 =="
+run_once env CS_REACTORS=1 /tmp/close_semantics
+rc_single=$?
 
 cat <<EOF
 
-Exit code: $rc
+Exit codes: default=$rc_default  CS_REACTORS=1=$rc_single
  - 0 = every case passed
  - non-zero = see the FAIL lines above; each one names the assertion that broke
 
-If a case fails, paste the whole output back -- the per-case line tells us
-whether it was the FIN/RST distinction (P1-4) or the accounting.
+The [phase] lines dump every counter. Read them as deltas between phases:
+accepted/rejected tells whether the accept loop handed the connection over,
+queueDrops tells whether a reactor refused the task, epollCtlErrors tells
+whether it refused the descriptor, and reactorFailures tells whether the
+worker is still alive at all. From the client side all four look identical.
+
+If a case fails, paste the whole output back -- first without CS_REACTORS, then
+with it.
 EOF
-exit "$rc"
+if [ "$rc_default" -ne 0 ] || [ "$rc_single" -ne 0 ]; then exit 1; fi
+exit 0
