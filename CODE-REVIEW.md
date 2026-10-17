@@ -136,12 +136,16 @@
   - **刻意不处理的边界**：任务已占额但尚未写入 wbuf 的字节由 `submitSend` 的 `isClosed` 分支自行回退——两处账目互斥，避免双减。这一点写在 `discardPendingOutput` 的注释里，避免后来者"补全"造成重复扣减。
   - **与 P1-1 的关联**：`pendingBytes` 在 P1-1 之后已退出写调度，只作限流计数；这条修复让它重新满足"入队 +size / 发送 −k / 关闭 −剩余"的三段式语义，为将来的全局水位统计打好底。
 
-### [P1-3] 连接的"成功语义"与统计口径相反：`accepted` 在入队时 +1，实际 `rejected` 发生在 reactor 线程
+### [P1-3] 连接的"成功语义"与统计口径相反：`accepted` 在入队时 +1，实际 `rejected` 发生在 reactor 线程　✅ 已修复（commit bcd2ead，与 P2-1 同批）
 
 - **位置**：`acceptLoop` L1169-1173 vs `submitNewConnection` L552-566 / L576-579
 - **缺陷模式**：D-05 复制粘贴变异（成功/失败分支的计数位置不一致）
 - **机理**：`accepted++` 只有在 `submitNewConnection()` 返回 true（**任务入队成功**）时才执行；但该 lambda 内仍可能因 `epoll_ctl ADD` 失败（L552）、map 插入异常（L561）、`onConnectionOpened` 失败（L568）而 `rejected++` 并直接返回。此前 `accepted` 已经 +1。结果 `accepted` 与 `rejected` **可以同时增长**，`accepted - closed` 也不再等于在线连接数；配合 P0-2 的那种静默失败，线上会出现"统计上明明有连接、实际一个都没有"。
 - **建议**：把 `accepted` 的 +1 移入 lambda、放在 `conns_[id] = c` 成功**之后**（即真正接管 fd 的那一刻），`acceptLoop` 只保留"入队失败则 rejected"。并在 `onConnectionOpened` 失败分支补一次 `epoll_ctl(DEL)`（见 P2-1）。
+- **已落地（commit `bcd2ead`，与 P2-1 合并为一个提交，因为两者改的是同一段代码）**：
+  - `accepted++` 移入 reactor lambda，位于 `conns_[id] = c` 与 `onConnectionOpened()` **都成功之后**；`acceptLoop` 只保留入队失败 → `rejected++`。
+  - `onConnectionOpened` 失败分支补上 `epoll_ctl(DEL)`（通过新抽出的 `unregisterConn()`），并补 `rejected++`。
+  - 结果：`accepted` 与 `rejected` 互斥，`accepted - closed == 在线连接数` 重新成立。
 
 ### [P1-4] 优雅关闭未 `shutdown(SHUT_WR)`：业务应答可能被丢弃；错误路径还直接 RST
 
@@ -167,13 +171,28 @@
   4. `start()/stop()` 100 次循环 + `ASan` 下跑，专抓 P0-1/P0-2（这两类只会在反复启停中暴露）；
   5. 用 `sendTo` + `closeConnection` 竞争测试 P1-4。
 
-### [P2-1] 三处注册失败后的回滚不完整
+### [P2-1] 三处注册失败后的回滚不完整　✅ 已修复（commit bcd2ead）
 
 - **位置**：
   - L552-555：`epoll_ctl ADD` 失败 → 直接 return，**`admitted_` 票券正常由 `admission` 析构释放**，无问题；但 `stats.rejected` 未计数（只有 L565/L578 计）
   - L568-572：`onConnectionOpened` 失败 → `fdIndex_.erase` + `conns_.erase` 后 return，但 epoll 里**仍保留对该 fd 的注册**，随后 `c->fd` 由 `Conn::~Conn` 关闭 —— fd 号被回收后若被新连接复用，同一 epoll 实例里可能残留旧注册
   - L562-563：`fdIndex_.erase` 在 `fdIndex_[c->fd] = c.get()` **之前**就已执行（异常发生在插入中），擦除的是"可能不存在的键"，无害但说明顺序是从别处复制来的
 - **建议**：抽一个 `unregisterConn(Conn*)`，统一下面三件事：`epoll_ctl(DEL)` → `fdIndex_.erase` → `conns_.erase`，所有失败分支都走它。`closeConn` 也复用它。
+- **已落地（commit `bcd2ead`）**：
+  ```cpp
+  inline void SubReactor::unregisterConn(Conn* c) noexcept {
+      if (c->fd < 0) return;
+      fdIndex_.erase(c->fd);
+      epoll_ctl(epollFd_, EPOLL_CTL_DEL, c->fd, nullptr);
+      ::close(c->fd);
+      c->fd = -1;
+      c->writeArmed = false;   // 让后续 arm 重新走一次完整的 ctl
+  }
+  ```
+  - 四处调用点：`epoll_ctl ADD` 失败、map 插入抛异常、`onConnectionOpened` 失败、`closeConn`。
+  - L562-563 那处"先 `erase` 再插入"的顺序问题随重构消失（原代码在异常路径里擦除的是可能不存在的键，虽无害但确实是复制粘贴的残留）。
+  - 注意：`conns_.erase` 由调用方按 `id` 负责（`unregisterConn` 只拿 `Conn*`，不查表），避免在遍历中二次查找。
+  - **未纳入本次**：`epoll_ctl ADD` 失败分支原来不计 `rejected`，本次已补齐；但它到底是"拒绝"还是"错误"在语义上更接近 `epollCtlErrors`，两个计数器都会 +1——保留双计数，理由是运维需要同时看到"总数上升"和"有连接没接成"。
 
 ### [P2-2] `SUBMISSION` 屏障为每帧加两次共享锁；`pendingBytes` 的内存序论证不成立
 
