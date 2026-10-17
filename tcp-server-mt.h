@@ -234,6 +234,10 @@ struct ServerStats {
     std::atomic<uint64_t> acceptErrors{0};
     std::atomic<uint64_t> pendingTasksTotal{0};  // 累计投递
     std::atomic<uint64_t> pendingTasksDepth{0};  // 当前队列深度（gauge）
+    // recv 返回 0（对端 FIN）的次数。一条对端已半关闭的连接在 level-triggered
+    // 下会让 epoll_wait 每次都立即返回同一个 EPOLLIN，所以这个数字同时是
+    // "reactor 是否在对着同一个 FIN 空转"的探针：停靠排空期间它应几乎不动。
+    std::atomic<uint64_t> eofReads{0};
 };
 
 // ==================== 发送结果 ====================
@@ -1004,6 +1008,7 @@ inline int SubReactor::handleRead(Conn* c) noexcept {
             // never sees the result. Park the close instead where we can: after
             // our own half-close, or (for an application close) with the FIN to
             // go out once wbuf drains.
+            server_->statsRef().eofReads.fetch_add(1, std::memory_order_relaxed);
             parseFrames(c, framesLeft);
             if (c->isClosed.load(std::memory_order_acquire)) return dispatched();
             if (framesLeft <= 0) {

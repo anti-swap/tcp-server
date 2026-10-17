@@ -14,6 +14,11 @@
 //      peer cannot mistake a truncated stream for a complete one.
 //   D. Every connection ends up accounted for: accepted == closed when idle, and
 //      the reservation for dropped output does not leak into connectionCount.
+//   E. A peer that half-closes (request, then shutdown(SHUT_WR)) is still owed
+//      the answer: every reply the handler queued must reach it, ahead of the
+//      FIN. And while that answer drains, the reactor must not busy-poll --
+//      level-triggered EPOLLIN on a FIN'd socket returns from every epoll_wait,
+//      so eofReads (FIN wakes) must stay flat during the drain, not run away.
 //
 // Build (Linux only):
 //   g++ -std=c++17 -Wall -Wextra -pthread verify/close_semantics.cpp -o close_semantics
@@ -222,7 +227,7 @@ void dumpStats(MultiReactorServer& server, const char* phase) {
     auto& st = server.stats();
     std::printf("    [%s] conns=%zu run=%d acc=%llu rej=%llu cls=%llu abt=%llu "
                 "perr=%llu qdrop=%llu ctl=%llu rfail=%llu tasks=%llu depth=%llu "
-                "frecv=%llu fsent=%llu\n",
+                "frecv=%llu fsent=%llu eof=%llu\n",
                 phase,
                 server.connectionCount(), (int)server.isRunning(),
                 (unsigned long long)st.accepted.load(),
@@ -236,7 +241,8 @@ void dumpStats(MultiReactorServer& server, const char* phase) {
                 (unsigned long long)st.pendingTasksTotal.load(),
                 (unsigned long long)st.pendingTasksDepth.load(),
                 (unsigned long long)st.framesRecv.load(),
-                (unsigned long long)st.framesSent.load());
+                (unsigned long long)st.framesSent.load(),
+                (unsigned long long)st.eofReads.load());
 }
 
 }  // namespace
@@ -257,6 +263,10 @@ int main() {
     // echo. It is driven from the client side below: the handler only echoes.
     std::atomic<bool> closeAfterReply{false};
     std::atomic<bool> replyQueued{false};
+    // Case E: when >0, the handler answers with this many 32KB frames instead of
+    // an echo -- an answer far larger than the client's receive buffer, so the
+    // drain is still in progress while the client below is asleep.
+    std::atomic<int> bigReplyFrames{0};
 
     MultiReactorServer::Config cfg;
     cfg.port = pickPort();
@@ -273,6 +283,13 @@ int main() {
 
     server.setMessageHandler([&](uint64_t id, const uint8_t* p, size_t n) {
         handled.fetch_add(1);
+        if (bigReplyFrames.load() > 0) {
+            const std::vector<uint8_t> chunk(32 * 1024, 0x5A);
+            for (int i = 0, total = bigReplyFrames.load(); i < total; ++i)
+                server.sendTo(id, chunk.data(), chunk.size());
+            replyQueued.store(true);
+            return;
+        }
         server.sendTo(id, p, n);                     // queue the reply
         replyQueued.store(true);
         if (closeAfterReply.exchange(false)) {
@@ -414,6 +431,54 @@ int main() {
         expect(waitFor(2000, [&] { return server.stats().aborted.load() >= 1; }),
                "aborted counted");
         dumpStats(server, "C.end");
+    }
+
+    // ---- E: peer half-closes while its answer is still queued ---------------
+    {
+        std::printf("E. peer FIN with replies still queued\n");
+        dumpStats(server, "E.begin");
+        int fd = connectTo(port);
+        expect(fd >= 0, "client connected");
+        // Shrink the peer's receive buffer so the answer cannot drain into it
+        // while the client sleeps: the server must park with bytes in wbuf,
+        // which is exactly the state this case is about. (The kernel doubles
+        // whatever is asked for here.)
+        int rcvbuf = 16384;
+        setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+
+        replyQueued.store(false);
+        bigReplyFrames.store(7);
+        const std::string req = "half-close-then-answer";
+        sendAll(fd, encode(FrameType::DATA, req.data(), req.size()));
+        // Done sending, still entitled to the answer. This is the HTTP/1.0-style
+        // exchange: request, half-close, read until FIN.
+        ::shutdown(fd, SHUT_WR);
+        expect(waitFor(2000, [&] { return replyQueued.load(); }), "handler ran");
+        bigReplyFrames.store(0);
+
+        const size_t wantBytes =
+            7 * (industrial::FRAME_HEADER_SIZE + 32 * 1024);
+
+        // The parked-drain window: nobody reads at this end for 250ms, so wbuf
+        // stays non-empty the whole time. eofReads counts how often the reactor
+        // woke to the same FIN -- with read interest left armed that is once
+        // per epoll_wait, i.e. thousands of times in this window.
+        const uint64_t e0 = server.stats().eofReads.load();
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        const uint64_t e1 = server.stats().eofReads.load();
+        std::printf("      eofReads +%llu over the 250ms parked window\n",
+                    (unsigned long long)(e1 - e0));
+        expect(e1 - e0 <= 20, "no busy-poll on the peer's FIN while draining");
+
+        ReadEnd end = ReadEnd::Invalid;
+        auto got = readToEnd(fd, end, 5000);
+        ::close(fd);
+        expect(end == ReadEnd::Fin, "wire ends with FIN, not RST or silence");
+        std::printf("      wire ended with: %s, %zu of %zu bytes\n",
+                    readEndName(end), got.size(), wantBytes);
+        expect(got.size() == wantBytes,
+               "every queued reply survived the peer's half-close");
+        dumpStats(server, "E.end");
     }
 
     // ---- D: accounting ------------------------------------------------------
