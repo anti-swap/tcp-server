@@ -283,7 +283,6 @@ struct Conn {
     bool       waitingOnReplies = false;
     int64_t    closeStartedAtMs = 0;   // when the graceful close was parked
     int64_t    finSentAtMs = 0;        // when shutdown(SHUT_WR) returned
-    const char* closeReason = nullptr;
 
     // 跨线程
     std::atomic<bool>   isClosed{false};
@@ -1228,7 +1227,10 @@ inline void SubReactor::teardownClosed(Conn* c, const char* reason, bool gracefu
     if (!c->isClosed.compare_exchange_strong(expected, true,
                                              std::memory_order_acq_rel))
         return;
-    c->closeReason = reason;
+    // reason is not stored on the connection: it is forwarded straight into the
+    // deferred callback below, which copies it. Keeping it here too buys nothing
+    // and lasts exactly as long as the caller's string does -- a trap for the
+    // next person to add a reader after the teardown has returned.
     unscheduleRead(c);
     // Anything still in wbuf will never be sent. Reconcile the byte reservation
     // with the buffer that backs it, or pendingBytes never drains for this
