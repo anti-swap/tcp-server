@@ -286,7 +286,32 @@ struct Conn {
 
     // 跨线程
     std::atomic<bool>   isClosed{false};
-    std::atomic<size_t> pendingBytes{0};   // wbuf 待发 + 未写入任务的字节
+    // Admission credit for output: bytes reserved and not yet handed to the
+    // kernel, whether they are still sitting in a queued send task or already
+    // sitting in wbuf. It is one number covering both because neither one alone
+    // says whether the peer is being kept up with.
+    //
+    // Lifecycle, which has to be read as the three places it is touched rather
+    // than the one place it happens to stay level:
+    //   1. reserve    -- enqueueing a frame adds its length (PONG included);
+    //   2. migrate    -- moving a frame from a queued task into wbuf changes
+    //                    nothing, and that is the only reason some paths nearby
+    //                    do not visibly adjust it;
+    //   3. release    -- subtracting what was actually written, what was dropped
+    //                    whole (capacity reject, closing connection, refused
+    //                    PONG), and what was still unsent when we tore down.
+    //
+    // Every release runs on the connection's owning reactor, so release/release
+    // never races. Reserving races between application threads and that same
+    // reactor's PONG path, and relaxed is enough for all of it: nothing
+    // non-atomic is published through this counter, the frame itself crosses
+    // under pendingMutex_, and RMW already guarantees no update is lost -- which
+    // is the property that matters, because a lost decrement is a permanent
+    // leak and a visible one in any watermark built on top. Ordering past that
+    // would only buy freshness, and freshness is not something this number can
+    // promise anyway: it is a best-effort ceiling, so reading a stale value
+    // costs one refused frame, never correctness.
+    std::atomic<size_t> pendingBytes{0};
     bool readPending = false; // Worker-owned continuation after a parsing budget.
     Conn* readNext = nullptr;
     Conn* readPrev = nullptr;
@@ -778,7 +803,7 @@ inline bool SubReactor::submitSend(uint64_t id,
             // so this task runs first. Anything arriving after that point is
             // refused here -- the FIN is already reserved for what we owe the peer.
             if (c->isClosed.load(std::memory_order_acquire) || c->closing) {
-                c->pendingBytes.fetch_sub(f.size(), std::memory_order_acq_rel);
+                c->pendingBytes.fetch_sub(f.size(), std::memory_order_relaxed);
                 if (c->closing)
                     server_->statsRef().bytesDropped.fetch_add(f.size(),
                                                                std::memory_order_relaxed);
@@ -794,7 +819,11 @@ inline bool SubReactor::submitSend(uint64_t id,
                 return;
             }
             c->wbuf.write(f.data(), f.size());
-            // pendingBytes 不变：从"未写入"迁移到"wbuf 内"。
+            // No release here: this is step 2 above, the byte count moving from
+            // "reserved by this task" to "reserved in wbuf". The drop branch just
+            // above does subtract, and the drain in handleWrite subtracts again
+            // later -- so "unchanged" is a statement about this path, not about
+            // the counter's behaviour anywhere else.
             // 不判断"是否由空变非空"：armWrite 本身是幂等的目标状态迁移，重复
             // arm 无副作用；而 wbuf.empty() 看不到 pendingBytes 里"已占额、尚未
             // 写入"的那部分，用它决定是否 arm 会在与 disarmWrite 交错时漏掉真正的
@@ -1057,17 +1086,20 @@ inline void SubReactor::parseFrames(Conn* c, int& framesLeft) noexcept {
 
         if (type == FrameType::PING) {
             const auto& pong = pongFrame();
-            size_t pending = c->pendingBytes.load();
+            size_t pending = c->pendingBytes.load(std::memory_order_relaxed);
             bool reserved = false;
             while (pending <= server_->cfg_.maxPendingBytes &&
                    pong.size() <= server_->cfg_.maxPendingBytes - pending) {
-                if (c->pendingBytes.compare_exchange_weak(pending, pending + pong.size())) {
+                if (c->pendingBytes.compare_exchange_weak(pending, pending + pong.size(),
+                                                          std::memory_order_relaxed,
+                                                          std::memory_order_relaxed)) {
                     reserved = true;
                     break;
                 }
             }
             if (!reserved || c->wbuf.writable() < pong.size()) {
-                if (reserved) c->pendingBytes.fetch_sub(pong.size());
+                if (reserved) c->pendingBytes.fetch_sub(pong.size(),
+                                                        std::memory_order_relaxed);
                 // 全帧规则同样适用：PONG 发不出去 → 对端长期不读，断开
                 // 强制断开：对端已经没有接收能力，再排空只是拖长描述符占用。
                 closeConn(c, "wbuf full on pong", false); return;
@@ -1147,7 +1179,7 @@ inline void SubReactor::discardPendingOutput(Conn* c) noexcept {
     const size_t remaining = c->wbuf.readable();
     if (remaining == 0) return;
     c->wbuf.clear();
-    c->pendingBytes.fetch_sub(remaining, std::memory_order_acq_rel);
+    c->pendingBytes.fetch_sub(remaining, std::memory_order_relaxed);
     server_->statsRef().bytesDropped.fetch_add(remaining, std::memory_order_relaxed);
 }
 
@@ -1864,19 +1896,22 @@ inline SendResult MultiReactorServer::sendTo(uint64_t connId,
         return SendResult::Overloaded;
     }
 
-    // 逻辑上限检查：pendingBytes = wbuf 待发 + 未写入任务
-    size_t old = c->pendingBytes.load();
+    // Ceiling check on the credit above. See pendingBytes for why this being a
+    // best-effort soft limit is what makes the relaxed orders there safe.
+    size_t old = c->pendingBytes.load(std::memory_order_relaxed);
     for (;;) {
         if (old > cfg_.maxPendingBytes || frame.size() > cfg_.maxPendingBytes - old) {
             stats_.queueDrops.fetch_add(1, std::memory_order_relaxed);
             return SendResult::Overloaded;
         }
-        if (c->pendingBytes.compare_exchange_weak(old, old + frame.size())) break;
+        if (c->pendingBytes.compare_exchange_weak(old, old + frame.size(),
+                                                  std::memory_order_relaxed,
+                                                  std::memory_order_relaxed)) break;
     }
 
     SubReactor* owner = c->owner;
     if (!owner || !owner->submitSend(connId, std::move(frame))) {
-        c->pendingBytes.fetch_sub(FRAME_HEADER_SIZE + len, std::memory_order_acq_rel);
+        c->pendingBytes.fetch_sub(FRAME_HEADER_SIZE + len, std::memory_order_relaxed);
         return SendResult::Overloaded;
     }
     return SendResult::Ok;
