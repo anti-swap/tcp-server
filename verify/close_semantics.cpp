@@ -44,6 +44,9 @@ using industrial::SendResult;
 namespace {
 
 int gFailures = 0;
+// Answered once, up front: everything else in this file reads the wire, and how
+// much of the wire there is to read depends on this.
+bool gZeroLinger = true;
 
 void expect(bool ok, const char* what) {
     std::printf("  [%s] %s\n", ok ? "PASS" : "FAIL", what);
@@ -144,6 +147,49 @@ std::vector<uint8_t> readToEnd(int fd, ReadEnd& end, int timeoutMs) {
     return out;
 }
 
+// Does this kernel turn SO_LINGER{on,0} into an RST the peer can observe?
+//
+// Case C depends on it, and it is a property of the machine rather than of the
+// server: the same object code produces a reset on one kernel and an orderly FIN
+// on another. Asking first keeps the suite comparable across machines instead of
+// turning a platform limitation into a standing "known failure" that eventually
+// stops being read.
+bool kernelHonoursZeroLinger() {
+    int ln = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (ln < 0) return false;
+    struct sockaddr_in sa{};
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (::bind(ln, (struct sockaddr*)&sa, sizeof(sa)) < 0) { ::close(ln); return false; }
+    ::listen(ln, 4);
+
+    socklen_t len = sizeof(sa);
+    ::getsockname(ln, (struct sockaddr*)&sa, &len);
+    int c = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (c < 0 || ::connect(c, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
+        if (c >= 0) ::close(c);
+        ::close(ln);
+        return false;
+    }
+    int sv = ::accept(ln, nullptr, nullptr);
+
+    struct linger lg{};
+    lg.l_onoff  = 1;
+    lg.l_linger = 0;
+    ::setsockopt(sv, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+    ::close(sv);
+
+    struct timeval tv{};
+    tv.tv_sec = 1;
+    ::setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    char b[8];
+    ssize_t n = ::recv(c, b, sizeof(b), 0);
+    const bool honouring = (n < 0 && errno == ECONNRESET);
+    ::close(c);
+    ::close(ln);
+    return honouring;
+}
+
 uint16_t pickPort() {
     int fd = ::socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in sa{};
@@ -200,6 +246,10 @@ int main() {
     // unbuffered. Without this the two streams interleave when piped, and an
     // interleaved failure log is worse than none.
     setvbuf(stdout, nullptr, _IONBF, 0);
+
+    gZeroLinger = kernelHonoursZeroLinger();
+    std::printf("== kernel turns SO_LINGER{on,0} into an observable RST: %s ==\n",
+                gZeroLinger ? "yes" : "NO - case C cannot assert it");
 
     // ---- server wiring -----------------------------------------------------
     std::atomic<int> handled{0};
@@ -289,22 +339,40 @@ int main() {
     {
         std::printf("B. close with request in flight\n");
         dumpStats(server, "B.begin");
+        // Take the ids that already exist: everything below must talk about the
+        // connection this block creates. Taking "whichever one is first" used to
+        // hand back a stale connection left behind by an earlier case, and each
+        // assertion then passed against the wrong socket while the one under test
+        // was quietly never closed.
+        const auto preexisting = server.connectionIds();
         int fd = connectTo(port);
         expect(fd >= 0, "client connected");
-        // Two complete requests, then close immediately: the second one may still
-        // be unread when the close is processed.
         uint64_t id = 0;
         expect(waitFor(2000, [&] {
-                   auto ids = server.connectionIds();
-                   if (ids.empty()) return false;
-                   id = ids.front();
-                   return true;
+                   for (uint64_t seen : server.connectionIds()) {
+                       bool stale = false;
+                       for (uint64_t old : preexisting) if (old == seen) stale = true;
+                       if (!stale) { id = seen; return true; }
+                   }
+                   return false;
                }), "connection id observed");
         std::printf("      observed id=%llu (0 means the wait never saw one)\n",
                     (unsigned long long)id);
 
+        // Two complete requests, then close. This case is about a request the
+        // server has been handed but has not necessarily read yet, and whether
+        // that stays true until the close lands cannot be left to timing: the
+        // client would be asking the network stack to win a race against itself,
+        // and sometimes it loses. bytesRecv says the bytes reached the server;
+        // whether the reactor has read them is deliberately left open, which is
+        // precisely what a graceful close has to cope with.
+        const uint64_t sentAt = server.stats().bytesRecv.load();
         sendAll(fd, encode(FrameType::DATA, "one", 3));
         sendAll(fd, encode(FrameType::DATA, "two", 3));
+        waitFor(2000, [&] {
+            return server.stats().bytesRecv.load() >=
+                   sentAt + 2 * (industrial::FRAME_HEADER_SIZE + 3);
+        });
         server.closeConnection(id);
 
         ReadEnd end = ReadEnd::Invalid;
@@ -329,14 +397,17 @@ int main() {
         ReadEnd end = ReadEnd::Invalid;
         readToEnd(fd, end, 2000);
         ::close(fd);
-        expect(end == ReadEnd::Reset, "peer observes RST on a protocol violation");
-        if (end != ReadEnd::Reset) {
-            std::printf("      wire ended with: %s\n", readEndName(end));
-            // An abort that counted internally but produced a clean FIN or a
-            // silent timeout is a different defect from one that never happened;
-            // the counter expectations below are satisfied by both.
-            std::printf("      the abort counted internally, so the reset itself "
-                        "did not reach this socket\n");
+        if (gZeroLinger) {
+            expect(end == ReadEnd::Reset, "peer observes RST on a protocol violation");
+        } else {
+            // Not assertable here, and not because the server declined to abort:
+            // the two counters below say it did. A bare socket pair asked for the
+            // same thing ends in an orderly FIN on this kernel, so there is no
+            // close -- however forceful -- that reaches a peer as a reset.
+            std::printf("  [SKIP] no wire RST is observable on this kernel: it "
+                        "ignores SO_LINGER{on,0} (checked against a bare socket "
+                        "pair), so case C can only assert the server's own "
+                        "evidence here\n");
         }
         expect(waitFor(2000, [&] { return server.stats().parseErrors.load() >= 1; }),
                "parseErrors counted");
