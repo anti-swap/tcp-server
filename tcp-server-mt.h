@@ -291,6 +291,7 @@ private:
 
     int               epollFd_ = -1;
     int               wakeFd_  = -1;
+    // Worker-owned: false means this reactor accepts no more submissions.
     std::atomic<bool> running_{false};
     std::thread       thread_;
 
@@ -345,7 +346,7 @@ public:
 
     bool start() noexcept;
     void stop()  noexcept;
-    void requestStop() noexcept { running_.store(false, std::memory_order_release); }
+    void requestStop() noexcept { requestStopInternal(); }
 #ifdef INDUSTRIAL_TCP_TESTING
     std::atomic<bool> failWorkerForTest{false};
     std::atomic<bool> failAcceptForTest{false};
@@ -364,7 +365,13 @@ public:
     // SubReactor 内部接口
     bool   onConnectionOpened(uint64_t id, std::shared_ptr<Conn> c) noexcept;
     void   onConnectionClosed(uint64_t id) noexcept;
-    bool   isRunning() const noexcept { return running_.load(std::memory_order_acquire); }
+    // Running means: lifecycle reached Running AND no component has failed.
+    // A reactor/accept thread failure only raises failed_; it never rewrites the
+    // lifecycle state, so start()'s success/failure verdict stays unambiguous.
+    bool   isRunning() const noexcept {
+        return life_.load(std::memory_order_acquire) == Life::Running &&
+               !failed_.load(std::memory_order_acquire);
+    }
     int    tickMs() const noexcept { return cfg_.tickMs; }
     int    idleTimeoutMs() const noexcept { return cfg_.idleTimeoutMs; }
     size_t rbufCapacity() const noexcept { return cfg_.rbufCapacity; }
@@ -376,6 +383,23 @@ public:
 private:
     friend class SubReactor;
 
+    // Lifecycle states. Only the thread holding lifecycleMutex_ moves the state
+    // out of/into Stopped; threads that merely observe a fatal error use fail().
+    enum class Life : int { Stopped = 0, Starting = 1, Running = 2, Stopping = 3 };
+
+    // Single upward-only failure flag shared by the accept loop and all reactors.
+    // Independent of the lifecycle state so it can be raised concurrently.
+    void fail() noexcept { failed_.store(true, std::memory_order_release); }
+    // Step down from Running and wake everyone; no-op unless Running.
+    void  requestStopInternal() noexcept {
+        Life expected = Life::Running;
+        if (life_.compare_exchange_strong(expected, Life::Stopping,
+                                          std::memory_order_acq_rel)) {
+            wakeAcceptLoop();
+        }
+    }
+    void wakeAcceptLoop() noexcept;
+
     bool        initListenSocket() noexcept;
     void        acceptLoop(std::promise<bool>& ready) noexcept;
     SubReactor* pickReactor() noexcept;
@@ -385,7 +409,8 @@ private:
     int epollFd_  = -1;
     int wakeFd_   = -1;
 
-    std::atomic<bool>     running_{false};
+    std::atomic<Life>     life_{Life::Stopped};
+    std::atomic<bool>     failed_{false};
     std::atomic<uint64_t> nextConnId_{1};
     std::atomic<size_t>   nextReactor_{0};
     // Lifecycle calls are serialized; submissions hold their barrier only until
@@ -868,7 +893,7 @@ inline void SubReactor::loop() noexcept {
             if (n < 0) {
                 if (errno == EINTR) continue;
                 server_->statsRef().reactorFailures.fetch_add(1);
-                server_->running_.store(false);
+                server_->fail();
                 break;
             }
             for (int i = 0; i < n; ++i) {
@@ -908,7 +933,9 @@ inline void SubReactor::loop() noexcept {
         }
     } catch (...) {
         server_->statsRef().reactorFailures.fetch_add(1, std::memory_order_relaxed);
-        server_->running_.store(false);
+        // Raise the failure flag only; the lifecycle state stays untouched so a
+        // concurrent start() verdict is not overwritten by a worker crash.
+        server_->fail();
     }
     // Reject submissions even when the loop failed rather than being stopped.
     {
@@ -957,13 +984,15 @@ inline bool MultiReactorServer::initListenSocket() noexcept {
 inline bool MultiReactorServer::start() noexcept {
     if (callbackServer_ == this) return false;
     std::lock_guard<std::mutex> lifecycle(lifecycleMutex_);
-    if (running_.exchange(true)) return true;
+    if (life_.load(std::memory_order_acquire) != Life::Stopped) return false;
+    life_.store(Life::Starting, std::memory_order_release);
+    failed_.store(false, std::memory_order_release);
     if (!reactors_.empty() || acceptThread_.joinable() ||
         cfg_.rbufCapacity < FRAME_HEADER_SIZE + MAX_FRAME_PAYLOAD ||
         cfg_.wbufCapacity < FRAME_HEADER_SIZE || cfg_.maxPendingBytes < FRAME_HEADER_SIZE ||
         cfg_.maxConnections <= 0 || cfg_.tickMs <= 0 || cfg_.idleTimeoutMs <= 0 ||
         cfg_.writeBudgetBytes == 0) {
-        running_.store(false);
+        life_.store(Life::Stopped, std::memory_order_release);
         return false;
     }
 
@@ -982,7 +1011,7 @@ inline bool MultiReactorServer::start() noexcept {
         }
     }
 
-    if (!initListenSocket()) { running_.store(false); return false; }
+    if (!initListenSocket()) { life_.store(Life::Stopped, std::memory_order_release); return false; }
 
     int nReactors = cfg_.numReactors > 0 ? cfg_.numReactors
                                          : (int)std::thread::hardware_concurrency();
@@ -991,7 +1020,7 @@ inline bool MultiReactorServer::start() noexcept {
 
     try { reactors_.reserve(nReactors); }
     catch (...) { ::close(listenFd_); listenFd_ = -1;
-                  running_.store(false); return false; }
+                  life_.store(Life::Stopped, std::memory_order_release); return false; }
 
     try {
     for (int i = 0; i < nReactors; ++i) {
@@ -1000,7 +1029,7 @@ inline bool MultiReactorServer::start() noexcept {
             for (auto& rr : reactors_) rr->stop();
             reactors_.clear();
             ::close(listenFd_); listenFd_ = -1;
-            running_.store(false); return false;
+            life_.store(Life::Stopped, std::memory_order_release); return false;
         }
         reactors_.push_back(std::move(r));
     }
@@ -1008,46 +1037,53 @@ inline bool MultiReactorServer::start() noexcept {
         for (auto& r : reactors_) r->stop();
         reactors_.clear();
         ::close(listenFd_); listenFd_ = -1;
-        running_.store(false); return false;
+        life_.store(Life::Stopped, std::memory_order_release); return false;
     }
 
     // ---- 启动同步：accept 线程初始化完成后 start 才返回 ----
+    // Success means "the accept loop is armed and no component has failed yet",
+    // not "the lifecycle counter is still false". A reactor that died during
+    // bring-up raises failed_ instead of rewriting the lifecycle state, so the
+    // verdict returned here cannot be flipped out from under the caller.
     try {
         auto ready = std::make_shared<std::promise<bool>>();
         auto fut = ready->get_future();
         acceptThread_ = std::thread([this, ready]() noexcept { acceptLoop(*ready); });
-        if (fut.get() && isRunning()) return true;
+        if (fut.get()) {
+            if (!failed_.load(std::memory_order_acquire)) {
+                life_.store(Life::Running, std::memory_order_release);
+                return true;
+            }
+        }
     } catch (...) {
     }
 
-    running_.store(false);
+    life_.store(Life::Stopping, std::memory_order_release);
     if (acceptThread_.joinable()) acceptThread_.join();
     for (auto& r : reactors_) r->stop();
     reactors_.clear();
     if (wakeFd_ >= 0) { ::close(wakeFd_); wakeFd_ = -1; }
     if (epollFd_ >= 0) { ::close(epollFd_); epollFd_ = -1; }
     if (listenFd_ >= 0) { ::close(listenFd_); listenFd_ = -1; }
+    failed_.store(false, std::memory_order_release);
+    life_.store(Life::Stopped, std::memory_order_release);
     return false;
 }
 
 inline void MultiReactorServer::stop() noexcept {
     if (callbackServer_ == this) { requestStop(); return; }
     std::lock_guard<std::mutex> lifecycle(lifecycleMutex_);
-    running_.store(false, std::memory_order_release);
+    // A second stop() (or a stop() after a failed start) must not rerun recovery:
+    // it would reopen the submission barrier and join threads that are not there.
+    if (life_.load(std::memory_order_acquire) == Life::Stopped) return;
+    life_.store(Life::Stopping, std::memory_order_release);
     {
         std::unique_lock<std::shared_mutex> submissions(submissionMutex_);
         // Drain callers that passed the running check before shutdown began.
     }
 
     // 先唤醒 accept 线程退出
-    {
-    std::lock_guard<std::mutex> descriptors(acceptFdMutex_);
-    if (wakeFd_ >= 0) {
-        uint64_t v = 1;
-        ssize_t r = ::write(wakeFd_, &v, sizeof(v));
-        (void)r;
-    }
-    }
+    wakeAcceptLoop();
     if (acceptThread_.joinable()) acceptThread_.join();
 
     // accept 线程退出后，安全关闭其持有的 fd
@@ -1061,11 +1097,25 @@ inline void MultiReactorServer::stop() noexcept {
 
     std::unique_lock<std::shared_mutex> lk(connsMutex_);
     conns_.clear();
+    failed_.store(false, std::memory_order_release);
+    life_.store(Life::Stopped, std::memory_order_release);
 }
 
 inline void MultiReactorServer::wait() noexcept {
-    while (running_.load(std::memory_order_acquire))
+    while (isRunning())
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
+}
+
+inline void MultiReactorServer::wakeAcceptLoop() noexcept {
+    // Only touches descriptors that the accept thread itself owns and closes
+    // under acceptFdMutex_, so a stop racing with accept-loop teardown can never
+    // write into a recycled fd number.
+    std::lock_guard<std::mutex> descriptors(acceptFdMutex_);
+    if (wakeFd_ >= 0) {
+        uint64_t v = 1;
+        ssize_t r = ::write(wakeFd_, &v, sizeof(v));
+        (void)r;
+    }
 }
 
 inline SubReactor* MultiReactorServer::pickReactor() noexcept {
@@ -1096,10 +1146,13 @@ inline void MultiReactorServer::acceptLoop(std::promise<bool>& ready) noexcept {
     }
 
     try { ready.set_value(ok); } catch (...) {}
-    if (!ok) requestStop();
+    // Descriptor setup failure is the accept loop's own failure: raise the shared
+    // flag instead of forcing the whole lifecycle down, so start() reports false
+    // through its normal recovery path rather than racing on the state.
+    if (!ok) { fail(); return; }
 
     std::array<struct epoll_event, 64> events{};
-    while (ok && running_.load(std::memory_order_acquire)) {
+    while (ok && isRunning()) {
 #ifdef INDUSTRIAL_TCP_TESTING
         if (failAcceptForTest.exchange(false)) throw 1;
 #endif
@@ -1107,7 +1160,7 @@ inline void MultiReactorServer::acceptLoop(std::promise<bool>& ready) noexcept {
         if (n < 0) {
             if (errno == EINTR) continue;
             stats_.reactorFailures.fetch_add(1);
-            running_.store(false);
+            fail();
             break;
         }
         for (int i = 0; i < n; ++i) {
@@ -1181,7 +1234,7 @@ inline void MultiReactorServer::acceptLoop(std::promise<bool>& ready) noexcept {
 
     } catch (...) {
         stats_.reactorFailures.fetch_add(1);
-        requestStop();
+        fail();
         try { ready.set_value(false); } catch (...) {}
     }
     // Close on every exit, including unexpected failure. The same mutex protects
@@ -1213,9 +1266,9 @@ inline SendResult MultiReactorServer::sendTo(uint64_t connId,
                                              const void* data, size_t len) noexcept {
     if (len > MAX_FRAME_PAYLOAD) return SendResult::TooLarge;
     if (len && !data) return SendResult::InvalidArgument;
-    if (!running_.load(std::memory_order_acquire)) return SendResult::Closed;
+    if (!isRunning()) return SendResult::Closed;
     std::shared_lock<std::shared_mutex> submissions(submissionMutex_);
-    if (!running_.load(std::memory_order_acquire)) return SendResult::Closed;
+    if (!isRunning()) return SendResult::Closed;
 
     std::shared_ptr<Conn> c;
     {
@@ -1253,9 +1306,9 @@ inline SendResult MultiReactorServer::sendTo(uint64_t connId,
 }
 
 inline void MultiReactorServer::closeConnection(uint64_t connId) noexcept {
-    if (!running_.load()) return;
+    if (!isRunning()) return;
     std::shared_lock<std::shared_mutex> submissions(submissionMutex_);
-    if (!running_.load()) return;
+    if (!isRunning()) return;
     std::shared_ptr<Conn> c;
     {
         std::shared_lock<std::shared_mutex> lk(connsMutex_);
