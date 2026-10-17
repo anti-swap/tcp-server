@@ -218,6 +218,9 @@ struct ServerStats {
     std::atomic<uint64_t> idleTimeouts{0};
     std::atomic<uint64_t> epollCtlErrors{0};
     std::atomic<uint64_t> reactorFailures{0};  // reactor 线程崩溃/退出异常
+    // accept4 因耗尽文件描述符而失败的次数。这是唯一能在启动时预测到的 accept
+    // 失败，因此也必须可数：没有它，唯一的症状是"它不再接受连接了，且一语不发"。
+    std::atomic<uint64_t> acceptErrors{0};
     std::atomic<uint64_t> pendingTasksTotal{0};// 累计投递
     std::atomic<uint64_t> pendingTasksDepth{0};// 当前队列深度（gauge）
 };
@@ -1477,13 +1480,36 @@ inline bool MultiReactorServer::start() noexcept {
         cfg_.maxPendingBytes = cfg_.wbufCapacity;
     }
 
-    // fd 上限检查（记录告警，不强制）
+    // ---- fd 上限：能抬就抬，抬不上去要说清楚能撑到多少 ----
+    // Warning and starting anyway hands operations a server that accepts the
+    // first thousand connections and then refuses everything without a word,
+    // which is worse than refusing to boot: it looks healthy until it isn't.
+    // Raising the soft limit is the one action here that cannot make things
+    // worse -- the hard ceiling stays where the environment put it -- so try it
+    // before reporting anything.
     struct rlimit rl{};
     if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+        if ((int)rl.rlim_cur < cfg_.maxConnections + 64 &&
+            rl.rlim_cur < rl.rlim_max) {
+            struct rlimit want = rl;
+            want.rlim_cur = rl.rlim_max;
+            if (setrlimit(RLIMIT_NOFILE, &want) == 0) {
+                std::fprintf(stderr,
+                    "[warn] raised RLIMIT_NOFILE %lu -> %lu for "
+                    "maxConnections=%d\n",
+                    (unsigned long)rl.rlim_cur, (unsigned long)rl.rlim_max,
+                    cfg_.maxConnections);
+                rl.rlim_cur = rl.rlim_max;
+            }
+        }
         if ((int)rl.rlim_cur < cfg_.maxConnections + 64) {
             std::fprintf(stderr,
-                "[warn] RLIMIT_NOFILE=%lu too low for maxConnections=%d\n",
-                (unsigned long)rl.rlim_cur, cfg_.maxConnections);
+                "[warn] RLIMIT_NOFILE=%lu (hard %lu) too low for "
+                "maxConnections=%d: connections beyond roughly %lu will be "
+                "refused, counted as acceptErrors\n",
+                (unsigned long)rl.rlim_cur, (unsigned long)rl.rlim_max,
+                cfg_.maxConnections,
+                (unsigned long)(rl.rlim_cur > 64 ? rl.rlim_cur - 64 : 0));
         }
     }
 
@@ -1678,6 +1704,18 @@ inline void MultiReactorServer::acceptLoop(std::promise<bool>& ready) noexcept {
                                     SOCK_NONBLOCK | SOCK_CLOEXEC);
                 if (cfd < 0) {
                     if (errno == EINTR) continue;
+                    // Out of descriptors is not an error to swallow and it is
+                    // not one to spin on either: the listening socket stays
+                    // readable, so returning to epoll_wait immediately means
+                    // burning a core rejecting nothing. It is also the one
+                    // accept failure that can be predicted at startup and
+                    // therefore should be countable -- without a counter the
+                    // only symptom is "it stopped accepting and said nothing".
+                    if (errno == EMFILE || errno == ENFILE) {
+                        stats_.acceptErrors.fetch_add(1, std::memory_order_relaxed);
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                        continue;
+                    }
                     break;
                 }
                 FdGuard cfdGuard(cfd);
