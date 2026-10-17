@@ -19,6 +19,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <cerrno>
+#include <cassert>
 
 #include <atomic>
 #include <algorithm>
@@ -67,22 +68,11 @@ inline int64_t nowMs() noexcept {
     return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
 }
 
-inline const std::array<uint8_t, FRAME_HEADER_SIZE>& pongFrame() noexcept {
-    static const std::array<uint8_t, FRAME_HEADER_SIZE> kPong = [] {
-        std::array<uint8_t, FRAME_HEADER_SIZE> v{};
-        uint16_t t = static_cast<uint16_t>(FrameType::PONG);
-        v[0] = (FRAME_MAGIC >> 8) & 0xFF;
-        v[1] =  FRAME_MAGIC       & 0xFF;
-        v[2] = (t >> 8) & 0xFF;
-        v[3] =  t       & 0xFF;
-        return v;
-    }();
-    return kPong;
-}
-
-inline void encodeFrameInto(uint8_t* out, FrameType type,
-                            const void* payload, size_t len) noexcept {
-    uint16_t t = static_cast<uint16_t>(type);
+// The header is eight bytes written big-endian, and from here on only this one
+// place writes it: keeping two copies of the same byte orderings around is how
+// they drift apart.
+inline void writeFrameHeader(uint8_t* out, FrameType type, size_t len) noexcept {
+    const uint16_t t = static_cast<uint16_t>(type);
     out[0] = (FRAME_MAGIC >> 8) & 0xFF;
     out[1] =  FRAME_MAGIC       & 0xFF;
     out[2] = (t >> 8) & 0xFF;
@@ -91,6 +81,25 @@ inline void encodeFrameInto(uint8_t* out, FrameType type,
     out[5] = (len >> 16) & 0xFF;
     out[6] = (len >>  8) & 0xFF;
     out[7] =  len        & 0xFF;
+}
+
+inline const std::array<uint8_t, FRAME_HEADER_SIZE>& pongFrame() noexcept {
+    static const std::array<uint8_t, FRAME_HEADER_SIZE> kPong = [] {
+        std::array<uint8_t, FRAME_HEADER_SIZE> v{};
+        writeFrameHeader(v.data(), FrameType::PONG, 0);
+        return v;
+    }();
+    return kPong;
+}
+
+inline void encodeFrameInto(uint8_t* out, FrameType type,
+                            const void* payload, size_t len) noexcept {
+    // A const char* source is assumed. len <= MAX_FRAME_PAYLOAD is enforced by
+    // sendTo, but this is an inline public entry point and nothing here would
+    // complain about a caller who did not check: it would just write a length
+    // the far side cannot honour.
+    assert(len <= MAX_FRAME_PAYLOAD);
+    writeFrameHeader(out, type, len);
     if (len > 0 && payload) std::memcpy(out + FRAME_HEADER_SIZE, payload, len);
 }
 
@@ -119,7 +128,13 @@ public:
     explicit RingBuffer(size_t cap) { init(cap); }
 
     // 可能抛 bad_alloc：调用方决定策略（连接建立时一次分配）
+    // A Conn is default-constructed and initialised a few lines later, so for a
+    // short while cap_ really is 0. Every `+= N % cap_` below is UB for that
+    // value -- integer division by zero, which is a trap rather than a wrong
+    // answer -- so it is rejected here instead of being argued about per method.
     void init(size_t cap) {
+        assert(empty());        // resizing over live data would drop it silently
+        assert(cap > 0);
         buf_.resize(cap);
         cap_  = cap;
         head_ = 0;
@@ -134,6 +149,7 @@ public:
 
     // 写入，返回实际写入字节数（全帧写入需先检查 writable() >= n）
     size_t write(const uint8_t* p, size_t n) noexcept {
+        if (cap_ == 0) return 0;   // uninitialised: see init()
         size_t w = std::min(n, writable());
         if (w == 0) return 0;
         size_t tail  = (head_ + size_) % cap_;
@@ -155,6 +171,7 @@ public:
 
     void consume(size_t n) noexcept {
         size_t r = std::min(n, size_);
+        if (r == 0) return;    // also covers the uninitialised cap_ == 0 case
         head_ = (head_ + r) % cap_;
         size_ -= r;
     }
