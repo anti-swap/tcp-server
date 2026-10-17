@@ -281,6 +281,7 @@ private:
     void handleWrite(Conn* c) noexcept;
     void parseFrames(Conn* c, int& framesLeft) noexcept;
     void closeConn(Conn* c, const char* reason) noexcept;
+    void unregisterConn(Conn* c) noexcept;
     void discardPendingOutput(Conn* c) noexcept;
     void finishClose(const std::shared_ptr<Conn>& c) noexcept;
     void flushCloseCallbacks() noexcept;
@@ -602,6 +603,7 @@ inline bool SubReactor::submitNewConnection(FdGuard fd, std::string peer,
                 ev.events = EPOLLIN; ev.data.fd = socket->fd;
                 if (epoll_ctl(epollFd_, EPOLL_CTL_ADD, socket->fd, &ev) < 0) {
                     server_->statsRef().epollCtlErrors.fetch_add(1, std::memory_order_relaxed);
+                    server_->statsRef().rejected.fetch_add(1, std::memory_order_relaxed);
                     return;  // The task's socket guard closes the descriptor.
                 }
                 c->fd = socket->release();
@@ -610,25 +612,30 @@ inline bool SubReactor::submitNewConnection(FdGuard fd, std::string peer,
                     fdIndex_[c->fd] = c.get();
                     conns_[id] = c;
                 } catch (...) {
-                    fdIndex_.erase(c->fd);
-                    ::close(c->fd);
-                    c->fd = -1;
+                    // Roll back through the same path every other failure uses, so
+                    // the epoll registration does not outlive the map entry and get
+                    // silently re-attributed when the fd number is recycled.
+                    unregisterConn(c.get());
                     server_->statsRef().rejected.fetch_add(1, std::memory_order_relaxed);
                     return;
                 }
                 if (!server_->onConnectionOpened(id, c)) {
-                    fdIndex_.erase(c->fd);
-                    conns_.erase(id);
+                    unregisterConn(c.get());
+                    server_->statsRef().rejected.fetch_add(1, std::memory_order_relaxed);
                     return;
                 }
+                // Counted only once the socket is fully owned by both maps: an
+                // accepted client must not inflate accepted when the reactor then
+                // rejects it, otherwise accepted - closed stops matching reality.
+                server_->statsRef().accepted.fetch_add(1, std::memory_order_relaxed);
 
                 auto& sh = server_->stateHandlerRef();
                 if (sh) sh(id, c->peer, true);
             } catch (...) {
-                // Before registration, the socket guard closes on failure.
-                server_->statsRef().rejected.fetch_add(1, std::memory_order_relaxed);
-            }
-        };
+                    // Before registration, the socket guard closes on failure.
+                    server_->statsRef().rejected.fetch_add(1, std::memory_order_relaxed);
+                }
+            };   // NOTE: accepted is bumped inside, not by the accept loop
     } catch (...) {
         // Local guards retain ownership if constructing the task fails.
         server_->statsRef().queueDrops.fetch_add(1, std::memory_order_relaxed);
@@ -866,6 +873,20 @@ inline void SubReactor::parseFrames(Conn* c, int& framesLeft) noexcept {
     }
 }
 
+// Single teardown path for "this fd must no longer be visible to this reactor".
+// Registration failures used to roll back by hand, and missed pieces: one path
+// closed the descriptor but left the epoll registration behind, so a recycled fd
+// number could arrive with stale interest attached. Every abort/close path goes
+// through here so those three steps can never drift apart again.
+inline void SubReactor::unregisterConn(Conn* c) noexcept {
+    if (c->fd < 0) return;
+    fdIndex_.erase(c->fd);
+    epoll_ctl(epollFd_, EPOLL_CTL_DEL, c->fd, nullptr);
+    ::close(c->fd);
+    c->fd = -1;
+    c->writeArmed = false;
+}
+
 // pendingBytes is reserved at enqueue time and released on two paths only:
 // a successful sendmsg (drainWbufToSocket) and an explicit whole-frame drop
 // (capacity reject in submitSend / PONG). A closing connection takes a third,
@@ -914,12 +935,7 @@ inline void SubReactor::closeConn(Conn* c, const char* reason) noexcept {
         auto it = conns_.find(c->id);
         if (it != conns_.end()) { keepAlive = it->second; conns_.erase(it); }
     }
-    if (c->fd >= 0) {
-        fdIndex_.erase(c->fd);
-        epoll_ctl(epollFd_, EPOLL_CTL_DEL, c->fd, nullptr);
-        ::close(c->fd);
-        c->fd = -1;
-    }
+    unregisterConn(c);   // fdIndex_ erase + EPOLL_CTL_DEL + close + fd = -1
 
     server_->statsRef().closed.fetch_add(1, std::memory_order_relaxed);
     server_->onConnectionClosed(c->id);
@@ -1348,11 +1364,12 @@ inline void MultiReactorServer::acceptLoop(std::promise<bool>& ready) noexcept {
 
                 uint64_t id = nextConnId_.fetch_add(1, std::memory_order_relaxed);
                 // Submission consumes ownership on both success and rejection.
+                // accepted is NOT bumped here: queueing a task is not a connection.
+                // The reactor bumps it once the socket is registered in both maps,
+                // so a task that fails during registration counts as rejected only.
                 auto admission = std::make_shared<Admission>(admitted_);
                 if (!r->submitNewConnection(std::move(cfdGuard), std::move(peer), id, std::move(admission))) {
                     stats_.rejected.fetch_add(1, std::memory_order_relaxed);
-                } else {
-                    stats_.accepted.fetch_add(1, std::memory_order_relaxed);
                 }
                 } catch (...) {
                     // Before handoff, cfdGuard still owns the accepted socket.
