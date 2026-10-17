@@ -1383,6 +1383,27 @@ inline bool MultiReactorServer::start() noexcept {
 
     if (!initListenSocket()) { life_.store(Life::Stopped, std::memory_order_release); return false; }
 
+    // ---- Running must be visible before any worker thread is constructed ----
+    // Every worker asks isRunning() whether it should keep working, and every
+    // worker asks it the instant its thread starts - long before this function
+    // gets anywhere near returning. Publishing Running later is therefore a
+    // race that each worker loses by default: it reads Starting, concludes the
+    // server never came up, and returns without ever reaching epoll_wait.
+    //
+    // Two instances of exactly this have shipped. The accept loop read Starting
+    // and fell through to its teardown, closing the listening socket while
+    // start() still answered true (P0-3). The reactors survived only when they
+    // happened to start slowly enough to see this store; a fast one exited with
+    // running_ = false and then quietly refused every connection round-robin
+    // handed it, which looked like nothing at all from the client side - the
+    // socket was accepted and closed again immediately, no logs, no counters
+    // anyone thinks to read.
+    //
+    // Everything above here already fails through the recovery path below and
+    // reports false; everything below here is threads that read this value the
+    // moment they come into existence. There is nothing left to wait for.
+    life_.store(Life::Running, std::memory_order_release);
+
     int nReactors = cfg_.numReactors > 0 ? cfg_.numReactors
                                          : (int)std::thread::hardware_concurrency();
     if (nReactors <= 0) nReactors = 1;
@@ -1410,25 +1431,13 @@ inline bool MultiReactorServer::start() noexcept {
         life_.store(Life::Stopped, std::memory_order_release); return false;
     }
 
-    // ---- 启动顺序：Running 必须先于 accept 线程可见 ----
-    // Unlike SubReactor, which sets its own running_ flag before spawning its
-    // thread, the accept loop has no run flag of its own: isRunning() is the
-    // only thing telling it to keep looping. Publishing Running *after* the
-    // handshake therefore races the accept thread itself - whoever reaches the
-    // first loop test first decides whether the loop ever runs. set_value()
-    // releases start(), but the instructions that follow it cost tens of
-    // nanoseconds while the wake-up of the waiting thread is a scheduler
-    // decision, so the accept thread usually wins: it reads Starting, decides
-    // the server is not running, skips the loop entirely and falls through to
-    // its teardown - which closes the listening socket. start() then returned
-    // true for a server that refuses every connection.
-    //
-    // Everything that can fail here has already been resolved: the listening
-    // socket is bound and the reactors are up. Running is published first and
-    // the handshake only reports whether the accept loop got armed; a failure
-    // there still makes start() return false through the recovery path below.
+    // ---- 启动同步：accept 线程报到后 start 才返回 ----
+    // Success means "the accept loop is armed and no component has failed yet",
+    // not "the lifecycle counter is still false". A component that died during
+    // bring-up raises failed_ instead of rewriting the lifecycle state, so the
+    // verdict returned here cannot be flipped out from under the caller.
+    // Running itself was published further up, before any worker existed.
     try {
-        life_.store(Life::Running, std::memory_order_release);
         auto ready = std::make_shared<std::promise<bool>>();
         auto fut = ready->get_future();
         acceptThread_ = std::thread([this, ready]() noexcept { acceptLoop(*ready); });
