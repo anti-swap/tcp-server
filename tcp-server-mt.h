@@ -1683,8 +1683,13 @@ inline bool MultiReactorServer::start() noexcept {
     // before reporting anything.
     struct rlimit rl{};
     if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
-        if (static_cast<int>(rl.rlim_cur) < cfg_.maxConnections + 64 &&
-            rl.rlim_cur < rl.rlim_max) {
+        const uintmax_t needed = static_cast<uintmax_t>(cfg_.maxConnections) + 64;
+        // Compare in uintmax_t, never int: RLIM_INFINITY is "no limit", and
+        // narrowing it to int wraps negative, which read as "too low" and
+        // printed a spurious warning on unlimited configurations.
+        uintmax_t cur = (rl.rlim_cur == RLIM_INFINITY)
+                        ? UINTMAX_MAX : static_cast<uintmax_t>(rl.rlim_cur);
+        if (cur < needed && rl.rlim_cur < rl.rlim_max) {
             struct rlimit want = rl;
             want.rlim_cur = rl.rlim_max;
             if (setrlimit(RLIMIT_NOFILE, &want) == 0) {
@@ -1693,17 +1698,18 @@ inline bool MultiReactorServer::start() noexcept {
                     "maxConnections=%d\n",
                     static_cast<uintmax_t>(rl.rlim_cur), static_cast<uintmax_t>(rl.rlim_max),
                     cfg_.maxConnections);
-                rl.rlim_cur = rl.rlim_max;
+                cur = (rl.rlim_max == RLIM_INFINITY)
+                      ? UINTMAX_MAX : static_cast<uintmax_t>(rl.rlim_max);
             }
         }
-        if (static_cast<int>(rl.rlim_cur) < cfg_.maxConnections + 64) {
+        if (cur < needed) {
             std::fprintf(stderr,
                 "[warn] RLIMIT_NOFILE=%ju (hard %ju) too low for "
                 "maxConnections=%d: connections beyond roughly %ju will be "
                 "refused, counted as acceptErrors\n",
                 static_cast<uintmax_t>(rl.rlim_cur), static_cast<uintmax_t>(rl.rlim_max),
                 cfg_.maxConnections,
-                static_cast<uintmax_t>(rl.rlim_cur > 64 ? rl.rlim_cur - 64 : 0));
+                cur > 64 ? cur - 64 : 0);
         }
     }
 
