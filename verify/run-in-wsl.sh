@@ -45,6 +45,7 @@ build() {
     local label="$1"; shift
     echo "== building [$label] =="
     g++ "${base_flags[@]}" "$@" verify/close_semantics.cpp -o /tmp/close_semantics
+    g++ "${base_flags[@]}" "$@" verify/backpressure.cpp -o /tmp/backpressure
     g++ "${base_flags[@]}" "$@" -DINDUSTRIAL_TCP_TESTING verify/fault_injection.cpp \
         -o /tmp/fault_injection
 }
@@ -56,6 +57,7 @@ run_all() {
 
     for attempt in "close_semantics, default reactors:/tmp/close_semantics" \
                    "close_semantics, CS_REACTORS=1:env CS_REACTORS=1 /tmp/close_semantics" \
+                   "backpressure:/tmp/backpressure" \
                    "fault_injection:/tmp/fault_injection"; do
         local name="${attempt%%:*}"
         local cmd="${attempt#*:}"
