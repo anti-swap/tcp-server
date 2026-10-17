@@ -488,6 +488,8 @@ class MultiReactorServer {
         // Grace period for a half-closed connection: after our FIN went out we
         // keep reading until the peer's FIN, but never longer than this. Bounds
         // the descriptor cost of a peer that ACKs the FIN and never answers it.
+        // Must be > 0 (start() refuses otherwise): with no deadline a parked
+        // close leaks the fd and its admission slot forever.
         int         closeLingerMs    = 5000;
 
         // Ceiling on reactors. Beyond a handful past the core count the only
@@ -1664,7 +1666,7 @@ inline bool MultiReactorServer::start() noexcept {
         cfg_.rbufCapacity < FRAME_HEADER_SIZE + MAX_FRAME_PAYLOAD ||
         cfg_.wbufCapacity < FRAME_HEADER_SIZE || cfg_.maxPendingBytes < FRAME_HEADER_SIZE ||
         cfg_.maxConnections <= 0 || cfg_.tickMs <= 0 || cfg_.idleTimeoutMs <= 0 ||
-        cfg_.writeBudgetBytes == 0) {
+        cfg_.writeBudgetBytes == 0 || cfg_.closeLingerMs <= 0) {
         life_.store(Life::Stopped, std::memory_order_release);
         return false;
     }
