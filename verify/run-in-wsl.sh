@@ -72,6 +72,20 @@ run_all() {
 
 overall=0
 
+# Does an exit code actually survive the trip into Linux?
+#
+# Every verdict below reads one. Handing a command to WSL as an inline string
+# (`bash -lc '...'`) reports $? = 0 for `false`, for `(exit 3)` and for a
+# program compiled to return 7 -- the success path and the failure path become
+# indistinguishable, and a suite whose outcome no longer depends on the outcome
+# is decoration. Through a script file it travels correctly. This probe states
+# which situation we are in before anything is trusted, rather than after.
+if ! timeout 300 bash verify/probe_exit_code.sh; then
+    echo "!! exit codes are not crossing into Linux correctly; results below are meaningless"
+    exit 2
+fi
+echo
+
 build "plain"
 run_all "plain" || overall=1
 
