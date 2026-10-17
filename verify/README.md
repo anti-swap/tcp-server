@@ -45,6 +45,13 @@ g++ -std=c++17 -Wall -Wextra -g -fsanitize=address,undefined \
 修饰——没有调用者就不会生成代码，语法与名字查找都没被触发。**注入必须在命名空间内部，
 且最好直接在已有函数体里引用未声明符号**，否则会得到另一个假阴性。
 
+**第三种形态：流水线本身没在编译。** 宿主 shell 的 PATH 会被上层包装脚本弄坏（`ls` / `tr` / `head`
+全部 command not found），此时 `build.sh` 会先走到「no C++ compiler」分支——这一层还算诚实，给了 exit 2。
+但一旦为了绕开它而换用别的调用方式，“输出为空”和“零诊断”就长得一模一样，
+而屏幕上照样没有报错。**做法：只要调用方式变了、或距上次成功过了很久，
+就先编译一个故意写错的对照文件**，确认它报出精确行号且 exit 1。
+这一轮正是因为先跑了对照，才敢相信头文件那两个 rc=0 是真的。
+
 ## close_semantics.cpp —— 唯一一个真正的运行时测试
 
 `close_semantics.cpp` 与 `compile_check.cpp` 不同：它断言的是**线上可见的行为**，编译器看不见。
@@ -63,6 +70,9 @@ g++ -std=c++17 -Wall -Wextra -pthread verify/close_semantics.cpp -o close_semant
 | C | 坏 magic → 对端观察到 RST，`parseErrors` / `aborted` 计数 |
 | D | `accepted == closed`，无连接泄漏 |
 
+> **首轮跑就抓了个 P0。** `accepted=0`、所有 `connect()` 直接失败：accept 线程在 `Running` 发布之前
+> 就判定自己该退出，循环一次都没进，顺手把监听套接字关了（CODE-REVIEW.md 的 P0-3）。静态审查没看出来，
+> 因为它取决于调度器先唤谁 —— 只有真机跑才会露头。这条路值得维护。
 `build.sh` 会**编译**（不链接、不运行）这个文件，用于捕捉公开接口漂移——例如 `closeConnection`
 改名这类 `compile_check.cpp` 完全发现不了的问题。为此还需要 `stub/posix_shim.h` 提供
 `sockaddr_in` / `htons` / `send` / `getsockname` / `SO_RCVTIMEO` 等测试端要用的声明。
