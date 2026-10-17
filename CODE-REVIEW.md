@@ -2,7 +2,8 @@
 
 - 审查时间：2026-10-17
 - 审查模式：full
-- 审查对象：`C:\Users\root\WorkBuddy\Claw\tcp-server\tcp-server-mt.h`（1281 行，单头文件，C++17 / Linux epoll 多 reactor TCP 服务端）
+- 审查对象：`Claw\tcp-server\tcp-server-mt.h`（单头文件，C++17 / Linux epoll 多 reactor TCP 服务端）
+- **状态：列表中的缺陷全部处理完毕（见"五、修复进度"）。最初是只读静态审查；现已逐个修改并逐条在 Linux 上验证，最后一节记录验证结论。**
 
 ## 一、环境与闭环状态
 
@@ -374,7 +375,7 @@
 | P2-1 | 注册失败回滚不完整 | ✅ | `bcd2ead` |
 | P1-4 | 缺 `shutdown(SHUT_WR)` 优雅关闭 | ✅ | `378183f` |
 | P1-5 | 无测试、故障注入开关无消费者 | ✅ | `dfbe046`、`28606fb` |
-| P2-2 | `sendTo` 双锁 + `pendingBytes` 内存序论证不成立 | ⬜ 待做 | — |
+| P2-2 | `sendTo` 双锁 + `pendingBytes` 内存序论证不成立 | 🟨 部分 | `8c3c61e`（B / C：`pendingBytes` 统一 relaxed 并写清理由）；A（`connsMutex_` 分片）未做 |
 | P2-3 | rlimit 只告警不动作 | ✅ | `384a062` |
 | P2-4 | `closeReason` 裸指针死字段 | ✅ | `a9d2c69` |
 | P2-5 | `doTick` O(N) 扫描未分片 / 队列上限是常量 | 🟨 部分 | `fa944a1`（队列上限；`doTick` 分片未做） |
@@ -393,7 +394,61 @@
 
 8192 一帧不差，说明卡住的位置就是那条常量。
 
-## 六、建议行动顺序
+**P2-2 的 B / C：`pendingBytes`**
+
+同一个 atomic 曾在三种内存序下被读写：有的 `relaxed`、有的 `acq_rel`、没写的地方默认是 `seq_cst`。
+问题不在于哪个序更"安全"，而在于**任何一个调用点都无法被当作一个决定来读** —— 要判断这个计数器
+是否安全，必须把全部调用点一起重建一遍；而旁边那句"pendingBytes 不变"只对自己所在的分支成立，
+它下面两行就有一个减法分支。
+
+现在把它真正在的情况写在了声明处：**所有释放都在归属 reactor 上跑**（释放之间互不相争）；唯一跨线程
+的一对是"应用线程预留 ↔ reactor 的 PONG 路径"，而帧本身是在 `pendingMutex_` 下交接的，这个计数器
+不承载任何非原子的发布。所以要成立的性质是"更新不丢失"，而 RMW 天然保证 —— 漏一次减就是永久泄漏，
+任何建立在它之上的水位都会一直虚高。据此统一为 `relaxed`，并写明它是"尽力而为的上限"，
+读到陈旧值的代价是少发一帧，不是出错。TSan 全套干净。
+
+**未做的部分**
+
+- **P2-2A `connsMutex_` 分片**：做完的意义是高扇出时少一半共享锁争用。不是缺陷，改的是热点路径上的
+  数据结构形态（`conns_` 拆桶会影响 `connectionCount` / `connectionIds` / `stop()` 与所有遍历），
+  风险与收益不匹配 —— 真要做，应当配一个吞吐基准先行，而不是在收尾时改散列表的形状。
+  已做的等价收益部分：帧编码（`resize` + 组帧）已不在 barrier 之下。
+- **P2-5 `doTick` 分片**：同上，且 tick 的 O(N) 每 500ms 一次，先把延迟做平之前需要有证据说明它真的在抢 epoll 那一线程。
+- **P2-6 剩余**：`std::array` 替代 16KB 栈数组、`acceptLoop` 的 `shared_ptr<promise>` 改裸指针、续读路径
+  `epoll_wait(..., 0)` 的忙轮询。三条都低优先且都不改变语义。
+
+## 六、验证结论（已完成）
+
+最后一条 asserts 用的不是"改完了"，而是**在 Linux 上把三种配置都跑一遍**。一行命令，幂等：
+
+```
+bash verify/run-in-wsl.sh                              # plain
+ENABLE_ASAN=1 bash verify/run-in-wsl.sh                # + AddressSanitizer / UndefinedBehaviorSanitizer
+ENABLE_TSAN=1 bash verify/run-in-wsl.sh                # + ThreadSanitizer
+ENABLE_ASAN=1 ENABLE_TSAN=1 bash verify/run-in-wsl.sh  # 全都要
+```
+
+当前结果（g++ 11.4，WSL1 / Linux 4.4.0-19041-Microsoft）：
+
+| 检查 | 结果 |
+|------|------|
+| `close_semantics`（默认 reactor 数） | 通过 |
+| 同上，`CS_REACTORS=1` | 通过 |
+| `backpressure`（一次广播排得下吗） | 通过，`queued 9000 of 9000` |
+| `fault_injection`（worker / accept 线程异常退出、反复重启 12 轮） | 通过 |
+| AddressSanitizer + UndefinedBehaviorSanitizer | 通过，四种用例各一份 |
+| ThreadSanitizer | 通过，四种用例各一份 |
+| cpplint（`CPPLINT.cfg`，100 列） | `tcp-server-mt.h: 0 findings` |
+
+关于"0 findings"的可信度：cpplint **不论有没有发现东西都返回 0**，而且 `Total errors found:` 只在非零时
+打印 —— 所以套件先验一个必定报错的对照文件，它不报错就不接受后面的干净结果。这已经是这套验证脚本里记录的第 8 种"假通过"（前七种见 `verify/README.md`，另有一条本机 TSan 的误报也记在那里）。
+
+> 本报告起初是只读静态审查；上文每一行"✅"都对应一次实际修改与一次实际运行。
+
+## 七、建议行动顺序（历史）
+
+以下是最初给出的顺序，**均已完成**。保留原样是因为它解释了为什么是这个次序 —— 靠它预测的失败形态，
+后来在真机上被逐条复现或未复现，这个对照本身有价值。
 
 1. **先修 P0-1 / P0-2 / P0-3**：这两条都属于"平时看不出来、只在启停竞争与关闭瞬间暴露"的问题，且都只需局部重构（状态机 + 延迟回调）。建议先补 `start/stop` × 100 + ASan 的冒烟测试，作为修复的验收标准 —— 否则修完也无法证明修好了。
 2. **再修 P1-1 / P1-2 / P1-4**：三者都在写路径上，建议合并为一次"写侧状态机 + 关闭协议"重构，改动集中在 `armWrite/disarmWrite/drainWbufToSocket/closeConn` 四个函数。
@@ -401,4 +456,4 @@
 4. **P1-5 / P2-3** 属于工程化，建议在本迭代内补齐，并把 `INDUSTRIAL_TCP_TESTING` 的开关纳入 CI 矩阵。
 5. **P2-2A / P2-5 / P2-6** 作为性能与可维护性优化，排入下一个迭代。
 
-> 本报告为只读静态审查，未修改任何源码。
+> 上述 5 条已全部处理完毕（第六条见"未做的部分"）。
