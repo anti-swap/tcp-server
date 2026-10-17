@@ -848,11 +848,15 @@ inline bool SubReactor::submitSend(uint64_t id,
             // refused here -- the FIN is already reserved for what we owe the peer.
             if (c->isClosed.load(std::memory_order_acquire) || c->closing) {
                 c->pendingBytes.fetch_sub(f.size(), std::memory_order_relaxed);
-                if (c->closing)
-                    server_->statsRef().bytesDropped.fetch_add(f.size(),
-                                                               std::memory_order_relaxed);
-                else
-                    server_->statsRef().queueDrops.fetch_add(1, std::memory_order_relaxed);
+                // One refusal, two questions, two counters: how many replies
+                // never went out (queueDrops) and how much data the peer never
+                // received (bytesDropped). Recording whichever one this branch
+                // happened to reach made the two incomparable across a close --
+                // the same event would show up as a frame drop or a byte drop
+                // depending on whether the teardown had finished yet.
+                server_->statsRef().bytesDropped.fetch_add(f.size(),
+                                                           std::memory_order_relaxed);
+                server_->statsRef().queueDrops.fetch_add(1, std::memory_order_relaxed);
                 return;
             }
 
