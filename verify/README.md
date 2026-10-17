@@ -157,6 +157,20 @@ g++ -std=c++17 -Wall -Wextra -pthread -DINDUSTRIAL_TCP_TESTING \
    现在这件事本身成了断言：`verify/probe_exit_code.sh` 最先跑，把管道不成立的情况直接判死，
    并说明它问了什么。
 
+## 一处 TSan 误报（此机器上）
+
+`backpressure.cpp` 要扣住 worker，最自然的写法是 mutex + `condition_variable`。本机（WSL1 /
+Ubuntu 的 g++ 11.4）的 ThreadSanitizer 会对此报 **double lock of a mutex**，紧接着报"同时被
+这把锁保护着"的标志量有 data race —— 而 **`verify/probe_tsan_condvar.sh` 里那段不含服务端、
+不含套接字的标准握手，报的是完全一样的两种错**。也就是说这是库/平台的性质。
+
+处理方式不是加 suppression：那等于让代码库永久地与 sanitizer 争执。改成在原子量上轮询并带
+20 秒上限 —— 要测的性质（worker 被扣住、队列没人排空）一点没变，可被误建模的构件没有了。
+改完之后 TSan 配置下该用例 `rc=0`。
+
+> 这里有一条更一般的教训：**sanitizer 报错时先做最小复现，不要先改代码**。上一节列的七条是
+> "明明错了却报绿"，这一条是它的镜像 —— "明明没错却报红"。两者都能把人带到完全错误的方向。
+
 ## 一处无法断言的地方（不是缺陷）
 
 本机内核（WSL1，4.4.0-19041-Microsoft）**不把 `SO_LINGER{on,0}` 变成 RST**：用一对裸 socket

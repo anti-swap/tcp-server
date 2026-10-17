@@ -31,13 +31,11 @@
 
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
-#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -114,20 +112,25 @@ int main() {
 
     MultiReactorServer server(cfg);
 
-    std::mutex              m;
-    std::condition_variable cv;
-    bool                    released  = false;
-    std::atomic<uint64_t>   connId{0};
-    std::atomic<bool>       reachedCb{false};
+    std::atomic<bool>   release{false};
+    std::atomic<uint64_t> connId{0};
+    std::atomic<bool>    reachedCb{false};
 
+    // Blocking the worker with a mutex plus a condition variable is the obvious
+    // spelling and it is what this used to do. Not here: this machine's
+    // ThreadSanitizer mis-models std::condition_variable::wait_for and reports
+    // "double lock of a mutex" followed by a race on the flag guarded by that
+    // mutex, with no server in the process at all -- see
+    // verify/probe_tsan_condvar.sh. Suppressing it would leave the codebase
+    // arguing with a sanitizer, so wait on an atomic with a deadline instead.
+    // Same property being tested, nothing left to mis-model.
     server.setConnStateHandler([&](uint64_t id, const std::string&, bool up) {
         if (!up) return;
         connId.store(id, std::memory_order_release);
-        std::unique_lock<std::mutex> lk(m);
         reachedCb.store(true, std::memory_order_release);
-        // Bounded even if the producer never gets here: a stuck wait has to look
-        // like a failed case eventually, not like a suite that never returns.
-        cv.wait_for(lk, std::chrono::seconds(20), [&] { return released; });
+        for (int i = 0; i < 20000 && !release.load(std::memory_order_acquire); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
     });
 
     expect(server.start(), "start() ok");
@@ -147,11 +150,7 @@ int main() {
         else                     ++refused;
     }
 
-    {
-        std::lock_guard<std::mutex> lk(m);
-        released = true;
-    }
-    cv.notify_all();
+    release.store(true, std::memory_order_release);
 
     expect(accepted == kFanOut, "every frame of a full fan-out was queued");
     expect(server.stats().queueDrops.load() == before,
