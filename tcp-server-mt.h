@@ -536,7 +536,12 @@ class MultiReactorServer {
 
     // Ok means queued, not delivered. Shutdown or disconnection can discard work.
     SendResult sendTo(uint64_t connId, const void* data, size_t len) noexcept;
-    void       closeConnection(uint64_t connId) noexcept;
+    // True means the request reached the owning reactor's queue. False means it
+    // did not -- the reactor refused it (its queue is at the cap) or there is no
+    // owner to hand it to -- and the connection is still open. Either way it is
+    // counted into closeRequestsDropped: a close nobody asked for is bad, but a
+    // close nobody was told about is how a connection outlives its own owner.
+    bool       closeConnection(uint64_t connId) noexcept;
 
     size_t connectionCount() const noexcept;
     std::vector<uint64_t> connectionIds() const;
@@ -2078,18 +2083,31 @@ inline SendResult MultiReactorServer::sendTo(uint64_t connId,
     return SendResult::Ok;
 }
 
-inline void MultiReactorServer::closeConnection(uint64_t connId) noexcept {
-    if (!isRunning()) return;
+inline bool MultiReactorServer::closeConnection(uint64_t connId) noexcept {
+    if (!isRunning()) return false;
     std::shared_lock<std::shared_mutex> submissions(submissionMutex_);
-    if (!isRunning()) return;
+    if (!isRunning()) return false;
     std::shared_ptr<Conn> c;
     {
         std::shared_lock<std::shared_mutex> lk(connsMutex_);
         auto it = conns_.find(connId);
-        if (it == conns_.end()) return;
+        if (it == conns_.end()) return false;
         c = it->second;
     }
-    if (c->owner) c->owner->submitClose(connId);
+    // Every exit from here reports itself in the same counter. The loss used to
+    // be silent: nothing anywhere recorded that this connection was asked to go
+    // away, so it simply waited for idle timeout while the application believed
+    // it had hung up. (The name says "dropped" because that is what happens to
+    // the request; the connection keeps living until something else ends it.)
+    if (!c->owner) {
+        stats_.closeRequestsDropped.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (!c->owner->submitClose(connId)) {
+        stats_.closeRequestsDropped.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    return true;
 }
 
 inline size_t MultiReactorServer::connectionCount() const noexcept {

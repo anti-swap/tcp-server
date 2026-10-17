@@ -216,10 +216,15 @@ int main() {
         expect(refused > 0, "the queue cap actually refused frames");
 
         const uint64_t before = server.stats().closeRequestsDropped.load();
-        server.closeConnection(connId.load(std::memory_order_acquire));
-        std::printf("      closeRequestsDropped +%llu\n",
+        // The returned bool is the same failure the caller can see; the counter
+        // is the one operations can see. Neither used to exist.
+        const bool queued = server.closeConnection(
+            connId.load(std::memory_order_acquire));
+        std::printf("      closeRequestsDropped +%llu, returned %s\n",
                     (unsigned long long)(server.stats().closeRequestsDropped.load()
-                                         - before));
+                                         - before),
+                    queued ? "true" : "false");
+        expect(!queued, "closeConnection() reports that it did not get through");
         expect(server.stats().closeRequestsDropped.load() > before,
                "a close the queue refused is counted, not swallowed");
 
