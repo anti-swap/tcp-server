@@ -58,7 +58,7 @@
   - `wait()` / `sendTo()` / `closeConnection()` 统一改用 `isRunning()`。
 - **残留**：本机无 Linux 工具链（WSL 被安全策略禁用、无 g++/clang++），**本次改动未经编译验证**，属 `[需核实:在 GCC ≥ 9 + -Wall -Wextra 下的编译结果]`，需在目标 Linux 环境跑一次 `start/stop × 100 + ASan` 冒烟。
 
-### [P0-2] `closeConn()` 在 handler 内同步析构 `shared_ptr<Conn>` → 可能对调用者 `this` 执行 `delete`
+### [P0-2] `closeConn()` 在 handler 内同步析构 `shared_ptr<Conn>` → 可能对调用者 `this` 执行 `delete`　✅ 已修复（commit c80a551）
 
 - **位置**：`SubReactor::closeConn()` L789-816，调用点 L624、L636、L645、L699、L710、L717、L724、L735、L742、L765、L778、L843、L892
 - **缺陷模式**：D-02 上下文丢失（跨组件生命周期）
@@ -71,6 +71,16 @@
   1. 把 `closeConn` 的副作用**外置为 reactor 拥有者的延迟队列**：标记关闭 → 从两个 map 摘除 → 把 `id/peer/reason` 与待触发回调压入 `activeTasks_`，由 `processPending()` 统一触发。届时 conn 已不再被闭包引用，回调再怎么样也影响不到 `this`。
   2. 或者至少把 `keepAlive`（L797 已拿到）与 `server_` 的守卫显式延长到函数末尾，并在 `cleanup()` 开头再取一次 `this` 的存活证据（该方法本身在 lambda 里执行，不够）。
   - 附：`region` 里 L810 `onConnectionClosed` 与 L811 `c->admission.reset()` 之间没有 `keepAlive` 相关的冲突，但 **`closeReason`（L794）只存了指针、没有拷贝**，调用方传字面量目前安全，一旦传 `std::string` 的 `.c_str()` 就是 UAF —— 见 P2-4。
+- **已落地（commit `c80a551`）**：
+  - `closeConn()` 只做"栈帧安全"的事：摘 list、`epoll_ctl(DEL)` + close fd、两个 map 去引用、计数；**不再调用任何用户回调**。
+  - 新增 `flushCloseCallbacks()`：先把 `pendingCloses_` 里的 `shared_ptr<Conn>` 释放（`finishClose`），**再**调用 `ConnStateHandler(false)` / `CloseHandler`——此刻该连接的引用计数已归零，回调不再可能让调用帧复活到已销毁对象。
+  - 触发点：`processPending()` **每个任务之后**、`loop()` 每个 epoll 批次之后（`doTick` 之前，它也走同一路径）、`cleanup()` 清空所有连接之后。
+  - `reason` / `peer` 在入队时拷贝（`reason` 原本是借用指针），deferred 之后生命周期才安全。
+  - 关闭批量内所有连接时，先把 `shared_ptr` 从 `conns_` 搬出并释放再 close，避免 `cleanup()` 的 `while` 迭代器持有引用导致回调里"连接还活着"的错觉。
+  - 在类头注释里显式写明：close/state-false 回调是延迟执行的、可以释放服务器的最后一个外部所有者。
+- **残留**：
+  - 回调现在不再与关闭发生在同一个调用帧，**时序上延后到本批任务/事件处理结束**——依赖"回调里立刻看到连接已消失"的调用方需改用 `connectionCount()` 之类的外部观测。
+  - `requestStop()`（回调内调用）只 CAS 状态 + 唤醒 accept 线程，不 join，这与原约定一致；但 `stop()` 在回调内被直接调用时仍会把 `Stopping` 置位，然后由控制线程完成 join —— 属既有约束，未变。
 
 ### [P1-1] `submitSend` 的 `wasEmpty` 判据与 `pendingBytes` 的"保留态"不匹配 → 可能永久挂起点：已写入 wbuf 却未 arm EPOLLOUT
 

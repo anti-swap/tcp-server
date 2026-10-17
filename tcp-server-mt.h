@@ -228,6 +228,11 @@ struct Conn {
     int64_t    lastRecvMs = 0;
     RingBuffer rbuf;
     RingBuffer wbuf;
+    // Target state of this socket's EPOLLOUT bit, owned by the worker thread.
+    // armWrite/disarmWrite are idempotent transitions toward it, never blind
+    // epoll_ctl calls, so a stale EPOLLOUT event cannot tear down a live write
+    // interest (and a queued frame cannot be stranded without a wakeup).
+    bool       writeArmed = false;
     const char* closeReason = nullptr;
 
     // 跨线程
@@ -647,11 +652,14 @@ inline bool SubReactor::submitSend(uint64_t id,
                 server_->statsRef().queueDrops.fetch_add(1, std::memory_order_relaxed);
                 return;
             }
-            bool wasEmpty = c->wbuf.empty();
             c->wbuf.write(f.data(), f.size());
-            // pendingBytes 不变：从"未写入"迁移到"wbuf 内"
+            // pendingBytes 不变：从"未写入"迁移到"wbuf 内"。
+            // 不判断"是否由空变非空"：armWrite 本身是幂等的目标状态迁移，重复
+            // arm 无副作用；而 wbuf.empty() 看不到 pendingBytes 里"已占额、尚未
+            // 写入"的那部分，用它决定是否 arm 会在与 disarmWrite 交错时漏掉真正的
+            // 写兴趣，导致已入 wbuf 的帧无限滞留。
             server_->statsRef().framesSent.fetch_add(1, std::memory_order_relaxed);
-            if (wasEmpty) armWrite(c);
+            armWrite(c);
         };
     } catch (...) {
         return false;
@@ -681,21 +689,38 @@ inline bool SubReactor::submitClose(uint64_t id) noexcept {
 }
 
 inline void SubReactor::armWrite(Conn* c) noexcept {
+    if (c->writeArmed || c->fd < 0) return;
     struct epoll_event ev{};
     ev.events = EPOLLIN | EPOLLOUT; ev.data.fd = c->fd;
-    if (epoll_ctl(epollFd_, EPOLL_CTL_MOD, c->fd, &ev) < 0) {
-        server_->statsRef().epollCtlErrors.fetch_add(1, std::memory_order_relaxed);
-        closeConn(c, "epoll write registration failed");
+    if (epoll_ctl(epollFd_, EPOLL_CTL_MOD, c->fd, &ev) == 0) {
+        c->writeArmed = true;
+        return;
     }
+    if (errno == ENOENT) {
+        // Registered set out of sync (fd was re-added elsewhere): restore it with
+        // ADD and adopt the write interest in the same call.
+        if (epoll_ctl(epollFd_, EPOLL_CTL_ADD, c->fd, &ev) == 0) {
+            c->writeArmed = true;
+            return;
+        }
+    }
+    server_->statsRef().epollCtlErrors.fetch_add(1, std::memory_order_relaxed);
+    closeConn(c, "epoll write registration failed");
 }
 
 inline void SubReactor::disarmWrite(Conn* c) noexcept {
+    if (!c->writeArmed) return;
+    // Still has bytes to flush: keep the interest instead of undoing a preceding
+    // armWrite. The caller is responsible for retrying the drain.
+    if (!c->wbuf.empty() || c->fd < 0) return;
     struct epoll_event ev{};
     ev.events = EPOLLIN; ev.data.fd = c->fd;
-    if (epoll_ctl(epollFd_, EPOLL_CTL_MOD, c->fd, &ev) < 0) {
+    if (epoll_ctl(epollFd_, EPOLL_CTL_MOD, c->fd, &ev) < 0 && errno != ENOENT) {
         server_->statsRef().epollCtlErrors.fetch_add(1, std::memory_order_relaxed);
         closeConn(c, "epoll read registration failed");
+        return;
     }
+    c->writeArmed = false;
 }
 
 inline int SubReactor::drainWbufToSocket(Conn* c) noexcept {
@@ -816,10 +841,11 @@ inline void SubReactor::parseFrames(Conn* c, int& framesLeft) noexcept {
                 // 全帧规则同样适用：PONG 发不出去 → 对端长期不读，断开
                 closeConn(c, "wbuf full on pong"); return;
             }
-            bool wasEmpty = c->wbuf.empty();
             c->wbuf.write(pong.data(), pong.size());
             server_->statsRef().framesSent.fetch_add(1, std::memory_order_relaxed);
-            if (wasEmpty) armWrite(c);
+            // 幂等的目标状态迁移；不用 "wasEmpty" 判断（见 submitSend 注释）
+            armWrite(c);
+            // closeConn 只标记 + 摘除，不再在栈内跑回调；但可能已因 arm 失败关闭
             if (c->isClosed.load()) return;
             c->rbuf.consume(len);
         } else if (type == FrameType::PONG) {
