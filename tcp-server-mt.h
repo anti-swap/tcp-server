@@ -184,6 +184,7 @@ struct ServerStats {
     std::atomic<uint64_t> bytesRecv{0};
     std::atomic<uint64_t> bytesSent{0};
     std::atomic<uint64_t> queueDrops{0};       // 全帧入队被拒次数
+    std::atomic<uint64_t> bytesDropped{0};     // 连接关闭时被丢弃的待发字节
     std::atomic<uint64_t> parseErrors{0};
     std::atomic<uint64_t> idleTimeouts{0};
     std::atomic<uint64_t> epollCtlErrors{0};
@@ -280,6 +281,7 @@ private:
     void handleWrite(Conn* c) noexcept;
     void parseFrames(Conn* c, int& framesLeft) noexcept;
     void closeConn(Conn* c, const char* reason) noexcept;
+    void discardPendingOutput(Conn* c) noexcept;
     void finishClose(const std::shared_ptr<Conn>& c) noexcept;
     void flushCloseCallbacks() noexcept;
     void armWrite(Conn* c) noexcept;
@@ -864,6 +866,24 @@ inline void SubReactor::parseFrames(Conn* c, int& framesLeft) noexcept {
     }
 }
 
+// pendingBytes is reserved at enqueue time and released on two paths only:
+// a successful sendmsg (drainWbufToSocket) and an explicit whole-frame drop
+// (capacity reject in submitSend / PONG). A closing connection takes a third,
+// previously missing path: the bytes still sitting in wbuf are never sent, so
+// they must be subtracted here or the reservation leaks for the lifetime of the
+// connection -- and any watermark built on it stays permanently inflated.
+//
+// Bytes still reserved by queued-but-unwritten send tasks are NOT handled here:
+// submitSend already releases them on the isClosed path, so this function must
+// never try to guess at them (it would double-count).
+inline void SubReactor::discardPendingOutput(Conn* c) noexcept {
+    const size_t remaining = c->wbuf.readable();
+    if (remaining == 0) return;
+    c->wbuf.clear();
+    c->pendingBytes.fetch_sub(remaining, std::memory_order_acq_rel);
+    server_->statsRef().bytesDropped.fetch_add(remaining, std::memory_order_relaxed);
+}
+
 // Close is split in two on purpose. closeConn() only does the work that is safe
 // to do inside a handler stack frame: unlist, detach the descriptor, drop both
 // maps' references, bump counters. It never destroys the connection (the caller
@@ -882,6 +902,12 @@ inline void SubReactor::closeConn(Conn* c, const char* reason) noexcept {
         return;
     c->closeReason = reason;
     unscheduleRead(c);
+    // The socket is going away, so whatever this connection still owed is now
+    // undeliverable. Reconcile the byte reservation with the buffer that backs
+    // it; otherwise pendingBytes never drains for this connection and any
+    // watermark derived from it (or from an aggregate) silently leaks.
+    // Accounted before the close so a close callback reading stats sees it.
+    discardPendingOutput(c);
 
     std::shared_ptr<Conn> keepAlive;
     {
