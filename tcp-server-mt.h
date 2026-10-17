@@ -298,6 +298,10 @@ struct Conn {
     // finishPeerClosed reuses the same once-guard for the mirror image: a peer
     // that half-closed while its answers were still queued as tasks.
     bool       waitingOnReplies = false;
+    // Peer's FIN has been seen (recv returned 0). Set once, in handleRead;
+    // handleWrite consults it to finish a parked close deterministically the
+    // moment the drain completes, instead of waiting for a spurious EPOLLIN.
+    bool       peerClosed = false;
     int64_t    closeStartedAtMs = 0;   // when the graceful close was parked
     int64_t    finSentAtMs = 0;        // when shutdown(SHUT_WR) returned
 
@@ -1011,6 +1015,7 @@ inline int SubReactor::handleRead(Conn* c) noexcept {
             // our own half-close, or (for an application close) with the FIN to
             // go out once wbuf drains.
             server_->statsRef().eofReads.fetch_add(1, std::memory_order_relaxed);
+            c->peerClosed = true;
             parseFrames(c, framesLeft);
             if (c->isClosed.load(std::memory_order_acquire)) return dispatched();
             if (framesLeft <= 0) {
@@ -1049,6 +1054,13 @@ inline void SubReactor::handleWrite(Conn* c) noexcept {
     }
     if (!c->wbuf.empty()) return;   // fair-share budget or EAGAIN: EPOLLOUT refires
 
+    // A parked peer-close finishes here, deterministically, instead of waiting
+    // for the next spurious EPOLLIN to notice the drain completed.
+    if (c->peerClosed) {
+        finishPeerClosed(c);
+        return;
+    }
+
     // wbuf is empty, so anything owed to the peer has reached the kernel: this is
     // the only place a FIN may be sent. A non-closing connection just drops its
     // write interest here; a parked close turns into a half-close.
@@ -1082,7 +1094,11 @@ inline bool SubReactor::tryBeginWriteShutdown(Conn* c) noexcept {
 //
 // What happens next depends on what is still owed, in the order that keeps the
 // FIN behind every byte:
-//   1. wbuf holds bytes     -- park; handleWrite resumes this once it drains.
+//   1. wbuf holds bytes     -- park, and drop EPOLLIN while parked: a FIN makes
+//      the socket readable for the rest of its life, so with level-triggered
+//      read interest still armed every epoll_wait returns at once and the
+//      reactor busy-polls for the whole drain (measured: +35k FIN wakes in
+//      250ms). handleWrite resumes this once wbuf empties.
 //   2. wbuf empty but pendingBytes > 0 -- replies are queued behind this batch.
 //      Defer exactly one queue round (waitingOnReplies) so they land in wbuf
 //      first; FIFO runs every task queued before this one first. At most once:
@@ -1097,7 +1113,23 @@ inline bool SubReactor::tryBeginWriteShutdown(Conn* c) noexcept {
 // for that with an RST it never earned (P0-5).
 inline void SubReactor::finishPeerClosed(Conn* c) noexcept {
     if (c->isClosed.load(std::memory_order_acquire)) return;
-    if (!c->wbuf.empty()) return;       // parked close finishes in handleWrite
+    if (!c->wbuf.empty()) {
+        // Parked with the write side still productive. Read interest is dropped
+        // for the rest of the drain (see the header comment): the only thing a
+        // read could deliver is the FIN we have already seen.
+        if (c->fd >= 0) {
+            struct epoll_event wev{};
+            wev.events  = EPOLLOUT;
+            wev.data.fd = c->fd;
+            if (epoll_ctl(epollFd_, EPOLL_CTL_MOD, c->fd, &wev) == 0)
+                c->writeArmed = true;
+            else
+                server_->statsRef().epollCtlErrors.fetch_add(1,
+                    std::memory_order_relaxed);
+            // A failed MOD keeps EPOLLIN armed: the drain spins, nothing breaks.
+        }
+        return;                    // parked close finishes in handleWrite
+    }
     if (!c->closing && !c->waitingOnReplies &&
         c->pendingBytes.load(std::memory_order_relaxed) > 0) {
         c->waitingOnReplies = true;
