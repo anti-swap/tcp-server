@@ -102,13 +102,29 @@ void sendAll(int fd, const std::vector<uint8_t>& f) {
     }
 }
 
-// Reads until FIN or RST. Returns bytes received; sets `reset` when the peer
-// answered with RST instead of an orderly FIN. Returns nothing (and reset=false)
-// for an invalid descriptor, so "no connection" cannot masquerade as either.
-std::vector<uint8_t> readToEnd(int fd, bool& reset, int timeoutMs) {
+// Three ways a read can end, kept apart on purpose. "orderly FIN", "nothing ever
+// arrived" and "RST" all leave recv() in a state that reads like success to a
+// caller who only asks "was it a reset?", and only the third is what case C is
+// actually about. Collapsing them is how a missing RST hides behind a clean FIN
+// and looks like a server that merely forgot to abort.
+enum class ReadEnd { Invalid, Fin, Timeout, Reset };
+
+const char* readEndName(ReadEnd e) {
+    switch (e) {
+        case ReadEnd::Fin:     return "FIN (orderly)";
+        case ReadEnd::Timeout: return "nothing arrived within the timeout";
+        case ReadEnd::Reset:   return "RST";
+        default:               return "no descriptor";
+    }
+}
+
+// Reads until FIN or RST. Returns bytes received and reports which of the three
+// endings it saw. An invalid descriptor reports Invalid rather than either of the
+// other two, so "no connection" cannot masquerade as a wire outcome either.
+std::vector<uint8_t> readToEnd(int fd, ReadEnd& end, int timeoutMs) {
     std::vector<uint8_t> out;
     uint8_t buf[4096];
-    reset = false;
+    end = ReadEnd::Invalid;
     if (fd < 0) return out;
 
     struct timeval tv{};
@@ -119,10 +135,10 @@ std::vector<uint8_t> readToEnd(int fd, bool& reset, int timeoutMs) {
     for (;;) {
         ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
         if (n > 0) { out.insert(out.end(), buf, buf + n); continue; }
-        if (n == 0) break;                                 // orderly FIN
+        if (n == 0) { end = ReadEnd::Fin; break; }         // orderly FIN
         if (errno == EINTR) continue;
-        if (errno == EAGAIN || errno == EWOULDBLOCK) break; // timeout, not a reset
-        reset = true;                                      // ECONNRESET etc.
+        if (errno == EAGAIN || errno == EWOULDBLOCK) { end = ReadEnd::Timeout; break; }
+        end = ReadEnd::Reset;                              // ECONNRESET etc.
         break;
     }
     return out;
@@ -252,11 +268,11 @@ int main() {
         sendAll(fd, encode(FrameType::DATA, payload.data(), payload.size()));
         expect(waitFor(2000, [&] { return replyQueued.load(); }), "handler ran");
 
-        bool reset = false;
-        auto got = readToEnd(fd, reset, 2000);
+        ReadEnd end = ReadEnd::Invalid;
+        auto got = readToEnd(fd, end, 2000);
         ::close(fd);
 
-        expect(!reset, "peer got FIN, not RST");
+        expect(end != ReadEnd::Reset, "peer got FIN, not RST");
         expect(got.size() == industrial::FRAME_HEADER_SIZE + payload.size(),
                "peer got exactly one framed reply");
         if (got.size() >= industrial::FRAME_HEADER_SIZE) {
@@ -291,10 +307,11 @@ int main() {
         sendAll(fd, encode(FrameType::DATA, "two", 3));
         server.closeConnection(id);
 
-        bool reset = false;
-        auto got = readToEnd(fd, reset, 2000);
+        ReadEnd end = ReadEnd::Invalid;
+        auto got = readToEnd(fd, end, 2000);
         ::close(fd);
-        expect(!reset, "close did not degenerate into RST");
+        expect(end != ReadEnd::Reset, "close did not degenerate into RST");
+        std::printf("      wire ended with: %s\n", readEndName(end));
         expect(!got.empty(), "at least the first reply was delivered");
         dumpStats(server, "B.end");
     }
@@ -309,10 +326,18 @@ int main() {
         std::memset(junk, 0x11, sizeof(junk));      // never a valid 0xEB90 header
         sendAll(fd, std::vector<uint8_t>(junk, junk + sizeof(junk)));
 
-        bool reset = false;
-        readToEnd(fd, reset, 2000);
+        ReadEnd end = ReadEnd::Invalid;
+        readToEnd(fd, end, 2000);
         ::close(fd);
-        expect(reset, "peer observes RST on a protocol violation");
+        expect(end == ReadEnd::Reset, "peer observes RST on a protocol violation");
+        if (end != ReadEnd::Reset) {
+            std::printf("      wire ended with: %s\n", readEndName(end));
+            // An abort that counted internally but produced a clean FIN or a
+            // silent timeout is a different defect from one that never happened;
+            // the counter expectations below are satisfied by both.
+            std::printf("      the abort counted internally, so the reset itself "
+                        "did not reach this socket\n");
+        }
         expect(waitFor(2000, [&] { return server.stats().parseErrors.load() >= 1; }),
                "parseErrors counted");
         expect(waitFor(2000, [&] { return server.stats().aborted.load() >= 1; }),
