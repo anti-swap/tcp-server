@@ -26,7 +26,7 @@
 
 ## 三、缺陷清单（按优先级）
 
-### [P0-1] accept 引导阶段存在 "fd 已发布、epoll 未注册" 的指令重排窗口
+### [P0-1] accept 引导阶段存在 "fd 已发布、epoll 未注册" 的指令重排窗口　✅ 已修复（commit ed08532）
 
 - **位置**：`initListenSocket()` L925-955 → `start()` L1018 → `acceptLoop()` L1077-1102
 - **缺陷模式**：D-02 上下文丢失（多线程发布顺序）
@@ -50,6 +50,13 @@
   - `isRunning()` 改为 `life_ == Running && !fatal_`；
   - `start()` 从 `Starting` 推进到 `Running` 只在 accept 线程确认 epoll 注册成功后进行（把 `ready.set_value` 与状态推进放在同一临界区）；
   - 这样"某个线程猝死"不会再产生 `start()` 语义歧义。
+- **已落地（commit `ed08532`）**：
+  - 新增 `enum class Life { Stopped, Starting, Running, Stopping }` + `std::atomic<bool> failed_`；`running_` 仅保留在 `SubReactor` 内部（纯 worker 私有语义）。
+  - `isRunning()` 改为 `life_ == Running && !failed_`，`start()` 在 accept 线程报到成功后把 `Starting → Running` 并返回 true。
+  - reactor/accept 的 `epoll_wait` 失败与异常一律走 `fail()`（单向置位），不再触碰生命周期；accept 描述符初始化失败也从 `requestStop()` 改为 `fail() + return`。
+  - `requestStop()` 改为 CAS `Running → Stopping`（原先是无条件 store，可能把 `Stopped` 拉回"假运行"）；`stop()` 在已 `Stopped` 时直接返回，恢复路径与 `stop()` 共用 `wakeAcceptLoop()`。
+  - `wait()` / `sendTo()` / `closeConnection()` 统一改用 `isRunning()`。
+- **残留**：本机无 Linux 工具链（WSL 被安全策略禁用、无 g++/clang++），**本次改动未经编译验证**，属 `[需核实:在 GCC ≥ 9 + -Wall -Wextra 下的编译结果]`，需在目标 Linux 环境跑一次 `start/stop × 100 + ASan` 冒烟。
 
 ### [P0-2] `closeConn()` 在 handler 内同步析构 `shared_ptr<Conn>` → 可能对调用者 `this` 执行 `delete`
 

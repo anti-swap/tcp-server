@@ -275,6 +275,8 @@ private:
     void handleWrite(Conn* c) noexcept;
     void parseFrames(Conn* c, int& framesLeft) noexcept;
     void closeConn(Conn* c, const char* reason) noexcept;
+    void finishClose(const std::shared_ptr<Conn>& c) noexcept;
+    void flushCloseCallbacks() noexcept;
     void armWrite(Conn* c) noexcept;
     void disarmWrite(Conn* c) noexcept;
     void doTick() noexcept;
@@ -300,6 +302,13 @@ private:
     std::vector<std::function<void()>> pendingTasks_;
     std::vector<std::function<void()>> activeTasks_;
 
+    // Deferred close notifications. Kept parallel and cleared together; entries
+    // are only touched by the worker thread.
+    std::vector<std::shared_ptr<Conn>> pendingCloses_;
+    std::vector<uint64_t>              pendingCloseIds_;
+    std::vector<std::string>           pendingClosePeers_;
+    std::vector<std::string>           pendingCloseReasons_;
+
     std::unordered_map<int, Conn*>                      fdIndex_;
     std::unordered_map<uint64_t, std::shared_ptr<Conn>> conns_;
 
@@ -314,7 +323,9 @@ public:
     // Message payload/peer/reason references are borrowed for the call only.
     // sendTo/closeConnection are permitted. stop from a callback requests shutdown
     // only; the controlling thread must subsequently call stop to join threads.
-    // Shutdown close callbacks run on the thread performing cleanup.
+    // Close/state-false callbacks are deferred: they run on the worker thread
+    // after the closing connection's stack frame has unwound, so they may drop
+    // the last external owner of this server.
     using MessageHandler   = std::function<void(uint64_t, const uint8_t*, size_t)>;
     using ConnStateHandler = std::function<void(uint64_t, const std::string&, bool)>;
     using CloseHandler = std::function<void(uint64_t, const std::string&, const char*)>;
@@ -437,7 +448,7 @@ private:
     ServerStats      stats_;
     MessageHandler   msgHandler_;
     ConnStateHandler stateHandler_;
-    CloseHandler closeHandler_;
+    CloseHandler     closeHandler_;
 };
 
 // ====================================================================
@@ -502,7 +513,13 @@ inline void SubReactor::cleanup() noexcept {
         pendingTasks_.clear();
     }
 
-    while (!conns_.empty()) closeConn(conns_.begin()->second.get(), "server shutdown");
+    while (!conns_.empty()) {
+        std::shared_ptr<Conn> c = conns_.begin()->second;
+        Conn* raw = c.get();
+        c.reset();
+        closeConn(raw, "server shutdown");
+    }
+    flushCloseCallbacks();
     activeTasks_.clear();
     conns_.clear();
     fdIndex_.clear();
@@ -534,8 +551,10 @@ inline void SubReactor::processPending() noexcept {
     for (auto& t : activeTasks_) {
         if (!running_.load() || !server_->isRunning()) break;
         t();
+        flushCloseCallbacks();
     }
     activeTasks_.clear();
+    flushCloseCallbacks();
 }
 
 inline bool SubReactor::enqueue(std::function<void()> task) noexcept {
@@ -646,7 +665,15 @@ inline bool SubReactor::submitClose(uint64_t id) noexcept {
     try {
         task = [this, id]() noexcept {
             auto it = conns_.find(id);
-            if (it != conns_.end()) closeConn(it->second.get(), "requested");
+            if (it != conns_.end()) {
+                // Copy out and reset the map handle before closing: the deferred
+                // close callbacks must not run while this frame holds the conn.
+                std::shared_ptr<Conn> c = it->second;
+                Conn* raw = c.get();
+                c.reset();
+                closeConn(raw, "requested");
+            }
+            flushCloseCallbacks();
         };
     } catch (...) { return false; }
 
@@ -811,6 +838,17 @@ inline void SubReactor::parseFrames(Conn* c, int& framesLeft) noexcept {
     }
 }
 
+// Close is split in two on purpose. closeConn() only does the work that is safe
+// to do inside a handler stack frame: unlist, detach the descriptor, drop both
+// maps' references, bump counters. It never destroys the connection (the caller
+// holds a shared_ptr) and never invokes user callbacks.
+//
+// USER CALLBACKS ARE DEFERRED. ConnStateHandler(false) / CloseHandler may call
+// stop() (allowed) or release the last external owner of MultiReactorServer; if
+// they ran here, the stack frame would resume on a destructed object -- this
+// reactor in particular, since cleanup()/stop() continue running from closeConn.
+// flushCloseCallbacks() drains them from a frame that owns no reference to the
+// closed connection, after the caller's keepAlive is gone.
 inline void SubReactor::closeConn(Conn* c, const char* reason) noexcept {
     bool expected = false;
     if (!c->isClosed.compare_exchange_strong(expected, true,
@@ -835,9 +873,45 @@ inline void SubReactor::closeConn(Conn* c, const char* reason) noexcept {
     server_->onConnectionClosed(c->id);
     c->admission.reset();
 
-    auto& sh = server_->stateHandlerRef();
-    if (sh) sh(c->id, c->peer, false);
-    if (server_->closeHandler_) server_->closeHandler_(c->id, c->peer, reason);
+    // Queue the deferred notification. The Conn stays alive inside
+    // pendingCloses_ until flushCloseCallbacks() drops it, so a callback never
+    // observes a connection that has already been destroyed. peer/reason are
+    // copied out: `reason` is borrowed for this call only and must not outlive
+    // the caller's frame.
+    pendingCloses_.push_back(keepAlive);
+    pendingCloseIds_.push_back(c->id);
+    pendingClosePeers_.push_back(c->peer);
+    pendingCloseReasons_.push_back(reason ? reason : "");
+}
+
+// Release our reference before running the callbacks: after this the connection
+// may be fully destroyed, which is exactly the state a deferred callback expects.
+inline void SubReactor::finishClose(const std::shared_ptr<Conn>& c) noexcept {
+    c.reset();
+}
+
+// Runs the deferred ConnStateHandler(false) / CloseHandler pairs. The vectors are
+// swapped out first, so a callback that closes more connections (or enqueues
+// work) lands in a fresh batch instead of invalidating this loop.
+//
+// All four vectors are cleared together so their indices always agree.
+inline void SubReactor::flushCloseCallbacks() noexcept {
+    std::vector<std::shared_ptr<Conn>> live;
+    std::vector<uint64_t>    ids;
+    std::vector<std::string> peers;
+    std::vector<std::string> reasons;
+    live.swap(pendingCloses_);
+    ids.swap(pendingCloseIds_);
+    peers.swap(pendingClosePeers_);
+    reasons.swap(pendingCloseReasons_);
+    if (ids.empty()) return;
+
+    for (size_t i = 0; i < ids.size(); ++i) {
+        if (i < live.size()) finishClose(live[i]);   // connection may die here
+        auto& sh = server_->stateHandlerRef();
+        if (sh) sh(ids[i], peers[i], false);
+        if (server_->closeHandler_) server_->closeHandler_(ids[i], peers[i], reasons[i].c_str());
+    }
 }
 
 inline void SubReactor::scheduleRead(Conn* c) noexcept {
@@ -923,7 +997,11 @@ inline void SubReactor::loop() noexcept {
                     handleWrite(c);
                 }
             }
+            // Deferred close callbacks run with no per-connection stack frames
+            // alive, so a callback may stop() or destroy the server safely.
+            flushCloseCallbacks();
             processPending();
+            flushCloseCallbacks();
 
             auto now = std::chrono::steady_clock::now();
             if (now - lastTick >= std::chrono::milliseconds(tickMs)) {
