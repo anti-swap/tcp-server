@@ -257,6 +257,10 @@ struct Conn {
     // reply out. Reads keep running throughout.
     bool       closing = false;
     bool       finSent = false;
+    // A graceful close whose final read dispatched requests: their replies are
+    // still queued, and the FIN waits for them. Bounds the wait to one round --
+    // a peer that keeps sending cannot hold the close open with more input.
+    bool       waitingOnReplies = false;
     int64_t    closeStartedAtMs = 0;   // when the graceful close was parked
     int64_t    finSentAtMs = 0;        // when shutdown(SHUT_WR) returned
     const char* closeReason = nullptr;
@@ -302,7 +306,10 @@ private:
     void wakeup() noexcept;
     void drainWakeup() noexcept;
     void processPending() noexcept;
-    void handleRead(Conn* c) noexcept;
+    // Returns the number of frames this call handed to the message handler. Zero
+    // means the read produced no work at all, which drainInputThenClose() uses to
+    // tell "the peer asked for nothing more" from "answers are queued behind us".
+    int  handleRead(Conn* c) noexcept;
     void handleWrite(Conn* c) noexcept;
     void parseFrames(Conn* c, int& framesLeft) noexcept;
     // graceful=true: whatever we still owe the peer is delivered before the FIN,
@@ -318,6 +325,10 @@ private:
     void teardownClosed(Conn* c, const char* reason, bool graceful) noexcept;
     void parkClose(Conn* c, const char* reason) noexcept;
     bool tryBeginWriteShutdown(Conn* c) noexcept;
+    // A graceful close asked for while the peer's request is still unread: reads
+    // and answers it before the FIN goes out. See the definition for why the FIN
+    // has to wait a queue round, and why it waits at most one.
+    void drainInputThenClose(Conn* c) noexcept;
     // Precondition: parseFrames has already drained every complete frame, so any
     // reply it triggered is queued ahead of the FIN this may send. handleRead
     // establishes that before calling in; it is not checked here.
@@ -752,7 +763,11 @@ inline bool SubReactor::submitClose(uint64_t id) noexcept {
                 std::shared_ptr<Conn> c = it->second;
                 Conn* raw = c.get();
                 c.reset();
-                closeConn(raw, "requested");
+                // Default (graceful): this is an application-level "we are done",
+                // so the reply queued just before it must still reach the peer --
+                // and so must answers to requests the peer already sent but this
+                // reactor has not read yet.
+                drainInputThenClose(raw);
             }
             flushCloseCallbacks();
         };
@@ -835,27 +850,32 @@ inline int SubReactor::drainWbufToSocket(Conn* c) noexcept {
 }
 
 // 读解析交错 + 每轮预算：防止单个客户端独占 reactor，也避免"rbuf 满含完整帧被误断"
-inline void SubReactor::handleRead(Conn* c) noexcept {
+inline int SubReactor::handleRead(Conn* c) noexcept {
     unscheduleRead(c);
     constexpr int kReadBudget  = 64 * 1024;
     constexpr int kFrameBudget = 256;
     int bytesLeft = kReadBudget, framesLeft = kFrameBudget;
     uint8_t tmp[16 * 1024];
+    // Frames this call handed to the handler. Every exit reports it, because
+    // "the peer asked nothing more" and "the peer asked, and answers for it are
+    // now queued behind whichever task called us" are not distinguishable from
+    // outside -- and only the second one has something to wait for.
+    auto dispatched = [&framesLeft] { return kFrameBudget - framesLeft; };
 
     for (;;) {
-        if (!server_->isRunning()) return;
+        if (!server_->isRunning()) return dispatched();
         // 先解析已有完整帧
         parseFrames(c, framesLeft);
-        if (c->isClosed.load(std::memory_order_acquire)) return;
+        if (c->isClosed.load(std::memory_order_acquire)) return dispatched();
         if (framesLeft <= 0 || bytesLeft <= 0) {
             scheduleRead(c);
-            return;
+            return dispatched();
         }
 
         if (c->rbuf.writable() == 0) {
             // 解析后仍满 → 半包过大，断开
             closeConn(c, "rbuf full with incomplete frame", false);
-            return;
+            return dispatched();
         }
 
         size_t want = std::min({sizeof(tmp), c->rbuf.writable(), (size_t)bytesLeft});
@@ -871,7 +891,7 @@ inline void SubReactor::handleRead(Conn* c) noexcept {
             // our own half-close, or (for an application close) with the FIN to
             // go out once wbuf drains.
             parseFrames(c, framesLeft);
-            if (c->isClosed.load(std::memory_order_acquire)) return;
+            if (c->isClosed.load(std::memory_order_acquire)) return dispatched();
             if (framesLeft <= 0) {
                 // Budget spent with bytes still buffered: complete frames are
                 // waiting whose handler has not run, and their replies have not
@@ -881,17 +901,17 @@ inline void SubReactor::handleRead(Conn* c) noexcept {
                 // Re-entering lands back here with a fresh budget and no pending
                 // frames, which is where the teardown actually happens.
                 scheduleRead(c);
-                return;
+                return dispatched();
             }
             finishPeerClosed(c);
-            return;
+            return dispatched();
         } else {
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 parseFrames(c, framesLeft);  // 再解析一次
-                return;
+                return dispatched();
             }
-            closeConn(c, "recv error", false); return;
+            closeConn(c, "recv error", false); return dispatched();
         }
     }
 }
@@ -1128,6 +1148,55 @@ inline void SubReactor::parkClose(Conn* c, const char* reason) noexcept {
     // exactly on the budget boundary. In both cases nothing more can be queued
     // (`closing` refuses submissions), so the FIN goes out now.
     tryBeginWriteShutdown(c);
+}
+
+// closeConnection() asked to hang up while the peer's request may still be
+// unread in the socket buffer. Those bytes arrived before this close did, so
+// answers to them are part of what "graceful" promises the peer: read and serve
+// them, then FIN.
+//
+// Skipping this still parses every frame and still runs the handler, so the
+// application believes it answered -- then submitSend refuses the replies
+// because `closing` is set, counts them into bytesDropped, and the peer receives
+// an orderly FIN over requests nobody ever answered. Nothing says so out loud:
+// framesRecv goes up, the handler ran, and only the byte count hints that a
+// request was taken in and served nothing.
+//
+// The FIN cannot go out from this frame even though the drain just finished.
+// Those replies are queued as tasks, behind this one, so wbuf reads empty here
+// and parkClose would half-close ahead of them. Resuming one queue round later
+// is what puts the answers in front of the FIN. It resumes at most once: a peer
+// that keeps sending would otherwise hold the close open with more input.
+inline void SubReactor::drainInputThenClose(Conn* c) noexcept {
+    if (c->isClosed.load(std::memory_order_acquire) || c->finSent) return;
+
+    const int served = handleRead(c);
+    // handleRead has its own exits: the peer's FIN may have arrived in the same
+    // read, or the socket may have errored. Either way the connection is already
+    // accounted for and there is nothing left for this request to do.
+    if (c->isClosed.load(std::memory_order_acquire) || c->finSent) return;
+
+    if (served == 0 || c->waitingOnReplies) {
+        parkClose(c, "requested");
+        return;
+    }
+
+    c->waitingOnReplies = true;
+    const uint64_t id = c->id;
+    if (enqueue([this, id]() noexcept {
+            auto it = conns_.find(id);
+            if (it == conns_.end()) return;
+            // Release the map's reference only after copying the pointer, so this
+            // frame holds nothing while parkClose may close the connection.
+            std::shared_ptr<Conn> keep = it->second;
+            Conn* raw = keep.get();
+            keep.reset();
+            parkClose(raw, "requested");
+        })) return;
+
+    // Nothing came of the hand-off -- queue full, or the reactor is going down.
+    // A late close beats an answer nobody would wait for, so honour it here.
+    parkClose(c, "requested");
 }
 
 // Unlist -> detach descriptor -> account -> queue deferred callbacks. Shared by
