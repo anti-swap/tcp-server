@@ -277,6 +277,13 @@ int main() {
     // belongs to one worker and not another shows up as everything passing.
     if (const char* r = std::getenv("CS_REACTORS")) cfg.numReactors = std::atoi(r);
     cfg.closeLingerMs = 300;          // keep the test short
+    // Case E needs an answer that cannot drain into the kernel while the client
+    // sleeps: loopback autotuning can grow the socket buffers into the
+    // megabytes, so both the per-connection wbuf and the pending ceiling are
+    // raised to hold an 8MB answer. (backpressure.cpp does the same, for the
+    // same reason.)
+    cfg.wbufCapacity    = 32 * 1024 * 1024;
+    cfg.maxPendingBytes = 32 * 1024 * 1024;
     std::printf("== target port: %u, bindAddr=%s, reactors=%d ==\n",
                 (unsigned)cfg.port, cfg.bindAddr.c_str(), cfg.numReactors);
     MultiReactorServer server(cfg);
@@ -447,7 +454,7 @@ int main() {
         setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 
         replyQueued.store(false);
-        bigReplyFrames.store(7);
+        bigReplyFrames.store(250);     // 250 x 32KB = 8MB: cannot drain in one go
         const std::string req = "half-close-then-answer";
         sendAll(fd, encode(FrameType::DATA, req.data(), req.size()));
         // Done sending, still entitled to the answer. This is the HTTP/1.0-style
@@ -457,7 +464,7 @@ int main() {
         bigReplyFrames.store(0);
 
         const size_t wantBytes =
-            7 * (industrial::FRAME_HEADER_SIZE + 32 * 1024);
+            250 * (industrial::FRAME_HEADER_SIZE + 32 * 1024);
 
         // The parked-drain window: nobody reads at this end for 250ms, so wbuf
         // stays non-empty the whole time. eofReads counts how often the reactor

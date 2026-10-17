@@ -295,6 +295,8 @@ struct Conn {
     // A graceful close whose final read dispatched requests: their replies are
     // still queued, and the FIN waits for them. Bounds the wait to one round --
     // a peer that keeps sending cannot hold the close open with more input.
+    // finishPeerClosed reuses the same once-guard for the mirror image: a peer
+    // that half-closed while its answers were still queued as tasks.
     bool       waitingOnReplies = false;
     int64_t    closeStartedAtMs = 0;   // when the graceful close was parked
     int64_t    finSentAtMs = 0;        // when shutdown(SHUT_WR) returned
@@ -1071,12 +1073,21 @@ inline bool SubReactor::tryBeginWriteShutdown(Conn* c) noexcept {
     return true;
 }
 
-// The peer has finished sending (recv returned 0). Callers reach this only once
-// handleRead has established that no complete frame is left unprocessed -- every
-// request has run its handler, so anything those handlers queued is already in
-// wbuf and FIN-ing after it is safe. FIN-ing ahead of a queued reply is what this
-// ordering exists to prevent: the write would either be refused by the kernel or
-// silently lost, and the peer would see a clean end to a truncated stream.
+// The peer has finished sending (recv returned 0). handleRead reaches this only
+// once no complete frame is left unprocessed -- but "every request has run its
+// handler" is NOT the same as "every reply is in wbuf": submitSend queues a
+// task, so the answers produced by this very batch are still behind us in the
+// queue, reserved in pendingBytes but not yet written. Tearing down here sends
+// an orderly FIN over replies nobody ever sees (case E: 0 of 229432 bytes).
+//
+// What happens next depends on what is still owed, in the order that keeps the
+// FIN behind every byte:
+//   1. wbuf holds bytes     -- park; handleWrite resumes this once it drains.
+//   2. wbuf empty but pendingBytes > 0 -- replies are queued behind this batch.
+//      Defer exactly one queue round (waitingOnReplies) so they land in wbuf
+//      first; FIFO runs every task queued before this one first. At most once:
+//      a producer racing the close must not hold the connection open forever.
+//   3. nothing outstanding  -- FIN (if we are closing) and tear down now.
 //
 // This is also the last chance to end the connection. Until it ran, an EOF with
 // nothing else outstanding left the socket registered and idle: the read event
@@ -1087,6 +1098,23 @@ inline bool SubReactor::tryBeginWriteShutdown(Conn* c) noexcept {
 inline void SubReactor::finishPeerClosed(Conn* c) noexcept {
     if (c->isClosed.load(std::memory_order_acquire)) return;
     if (!c->wbuf.empty()) return;       // parked close finishes in handleWrite
+    if (!c->closing && !c->waitingOnReplies &&
+        c->pendingBytes.load(std::memory_order_relaxed) > 0) {
+        c->waitingOnReplies = true;
+        const uint64_t id = c->id;
+        if (enqueue([this, id]() noexcept {
+                auto it = conns_.find(id);
+                if (it == conns_.end()) return;
+                // Copy the pointer, then drop this frame's reference before the
+                // resumed check: it may tear the connection down.
+                std::shared_ptr<Conn> keep = it->second;
+                Conn* raw = keep.get();
+                keep.reset();
+                finishPeerClosed(raw);
+            })) return;
+        // The hand-off failed (queue full, or the reactor is going down): a
+        // late FIN beats an answer nobody can wait for any longer.
+    }
     if (c->closing && !c->finSent) {
         // Still closing on our side and the peer declared itself done too: the
         // only thing left is the FIN. Anything a handler queued was drained above
