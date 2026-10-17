@@ -425,6 +425,24 @@ public:
         // keep reading until the peer's FIN, but never longer than this. Bounds
         // the descriptor cost of a peer that ACKs the FIN and never answers it.
         int         closeLingerMs    = 5000;
+
+        // Ceiling on reactors. Beyond a handful past the core count the only
+        // thing extra workers buy is more cross-thread hand-off.
+        static constexpr int kMaxReactors = 64;
+
+        // What this configuration actually resolves to, with "0 means decide for
+        // me" resolved and the ceiling applied. Two places computing it
+        // independently is how a number like this ends up disagreeing with
+        // itself, which is what was happening: start() clamped to a literal 64
+        // while everything that needed to know the count had to guess again.
+        int resolvedReactorCount() const noexcept {
+            int n = numReactors > 0
+                        ? numReactors
+                        : static_cast<int>(std::thread::hardware_concurrency());
+            if (n <= 0) n = 1;
+            if (n > kMaxReactors) n = kMaxReactors;
+            return n;
+        }
     };
 
     explicit MultiReactorServer(Config cfg) noexcept : cfg_(std::move(cfg)) {}
@@ -1538,10 +1556,9 @@ inline bool MultiReactorServer::start() noexcept {
     // moment they come into existence. There is nothing left to wait for.
     life_.store(Life::Running, std::memory_order_release);
 
-    int nReactors = cfg_.numReactors > 0 ? cfg_.numReactors
-                                         : (int)std::thread::hardware_concurrency();
-    if (nReactors <= 0) nReactors = 1;
-    if (nReactors > 64) nReactors = 64;
+    // Same resolution as everywhere else; see Config::resolvedReactorCount for
+    // why this is not computed here.
+    int nReactors = cfg_.resolvedReactorCount();
 
     try { reactors_.reserve(nReactors); }
     catch (...) { ::close(listenFd_); listenFd_ = -1;
