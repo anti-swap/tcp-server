@@ -53,16 +53,37 @@ void expect(bool ok, const char* what) {
 
 int connectTo(uint16_t port) {
     int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
+    if (fd < 0) {
+        std::printf("      socket() failed: errno=%d (%s)\n", errno, std::strerror(errno));
+        return -1;
+    }
     struct sockaddr_in sa{};
     sa.sin_family = AF_INET;
     sa.sin_port   = htons(port);
     sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     if (::connect(fd, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
+        // Do not swallow this: it is the difference between "the server rejected
+        // us" and "nothing is listening at all", and it decides where to look.
+        std::printf("      connect(127.0.0.1:%u) failed: errno=%d (%s)\n",
+                    (unsigned)port, errno, std::strerror(errno));
         ::close(fd);
         return -1;
     }
     return fd;
+}
+
+// Is anything listening on this port at all? Used to tell "server failed to
+// bind" apart from "server bound but the accept loop never ran".
+bool portIsListening(uint16_t port) {
+    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return false;
+    struct sockaddr_in sa{};
+    sa.sin_family = AF_INET;
+    sa.sin_port   = htons(port);
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    bool ok = ::connect(fd, (struct sockaddr*)&sa, sizeof(sa)) == 0;
+    ::close(fd);
+    return ok;
 }
 
 std::vector<uint8_t> encode(FrameType type, const void* payload, size_t len) {
@@ -81,16 +102,19 @@ void sendAll(int fd, const std::vector<uint8_t>& f) {
 }
 
 // Reads until FIN or RST. Returns bytes received; sets `reset` when the peer
-// answered with RST instead of an orderly FIN.
+// answered with RST instead of an orderly FIN. Returns nothing (and reset=false)
+// for an invalid descriptor, so "no connection" cannot masquerade as either.
 std::vector<uint8_t> readToEnd(int fd, bool& reset, int timeoutMs) {
+    std::vector<uint8_t> out;
+    uint8_t buf[4096];
+    reset = false;
+    if (fd < 0) return out;
+
     struct timeval tv{};
     tv.tv_sec  = timeoutMs / 1000;
     tv.tv_usec = (timeoutMs % 1000) * 1000;
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-    std::vector<uint8_t> out;
-    uint8_t buf[4096];
-    reset = false;
     for (;;) {
         ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
         if (n > 0) { out.insert(out.end(), buf, buf + n); continue; }
@@ -128,6 +152,11 @@ bool waitFor(int ms, const std::function<bool()>& pred) {
 }  // namespace
 
 int main() {
+    // Unbuffered stdout: the server prints its warnings to stderr, which is
+    // unbuffered. Without this the two streams interleave when piped, and an
+    // interleaved failure log is worse than none.
+    setvbuf(stdout, nullptr, _IONBF, 0);
+
     // ---- server wiring -----------------------------------------------------
     std::atomic<int> handled{0};
     // Case A needs close-then-send-safe ordering, i.e. the close *after* the
@@ -140,6 +169,8 @@ int main() {
     cfg.bindAddr = "127.0.0.1";
     cfg.numReactors = 2;
     cfg.closeLingerMs = 300;          // keep the test short
+    std::printf("== target port: %u, bindAddr=%s, reactors=%d ==\n",
+                (unsigned)cfg.port, cfg.bindAddr.c_str(), cfg.numReactors);
     MultiReactorServer server(cfg);
 
     server.setMessageHandler([&](uint64_t id, const uint8_t* p, size_t n) {
@@ -154,8 +185,23 @@ int main() {
     });
 
     if (!server.start()) {
-        std::printf("server.start() failed\n");
+        std::printf("server.start() FAILED (port %u) - nothing is listening; "
+                    "every case below will fail for that reason alone\n",
+                    (unsigned)cfg.port);
         return 1;
+    }
+    std::printf("== server.start() ok; isRunning=%d ==\n", (int)server.isRunning());
+    if (!server.isRunning()) {
+        std::printf("WARNING: start() returned true but isRunning() is false "
+                    "- a component raised the failure flag during bring-up\n");
+    }
+
+    // Probe once here so a bind/accept-loop failure is reported before any case
+    // runs, instead of being guessed at from a pile of per-case failures.
+    if (!portIsListening(cfg.port)) {
+        std::printf("FATAL: nothing is listening on 127.0.0.1:%u after a "
+                    "successful start() - the accept loop did not come up\n",
+                    (unsigned)cfg.port);
     }
 
     const uint16_t port = cfg.port;
