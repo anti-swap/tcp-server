@@ -82,7 +82,7 @@
   - 回调现在不再与关闭发生在同一个调用帧，**时序上延后到本批任务/事件处理结束**——依赖"回调里立刻看到连接已消失"的调用方需改用 `connectionCount()` 之类的外部观测。
   - `requestStop()`（回调内调用）只 CAS 状态 + 唤醒 accept 线程，不 join，这与原约定一致；但 `stop()` 在回调内被直接调用时仍会把 `Stopping` 置位，然后由控制线程完成 join —— 属既有约束，未变。
 
-### [P1-1] `submitSend` 的 `wasEmpty` 判据与 `pendingBytes` 的"保留态"不匹配 → 可能永久挂起点：已写入 wbuf 却未 arm EPOLLOUT
+### [P1-1] `submitSend` 的 `wasEmpty` 判据与 `pendingBytes` 的"保留态"不匹配 → 可能永久挂起点：已写入 wbuf 却未 arm EPOLLOUT　✅ 已修复（commit 478e074）
 
 - **位置**：`submitSend` L594-611（`bool wasEmpty = c->wbuf.empty();`）
 - **缺陷模式**：D-07 隐式假设（"wbuf 空 ⇒ 没有未完成的写"是错误假设）
@@ -107,6 +107,13 @@
   }
   ```
   `submitSend` 里直接 `armWrite(c)`，并把"是否有数据待发"的唯一真相源收敛到 `wbuf`（`pendingBytes` 只用于限流，不再参与调度决策）。这样两个方向的竞态都被消除。
+- **已落地（commit `478e074`）**：
+  - `Conn::writeArmed`（worker 独占）记录该 socket **期望的** `EPOLLOUT` 状态。
+  - `armWrite()`：已 arm 则直接返回（不再发 `epoll_ctl`）；`ENOENT`（注册丢失）用 `EPOLL_CTL_ADD` 修复并同步置位，而不是把连接关掉。
+  - `disarmWrite()`：未 arm 则 no-op；`wbuf` 非空时**拒绝撤销**，交给调用方继续 drain。
+  - `submitSend` 与 PING 分支的 `wasEmpty` 判断全部删除，改为无条件 `armWrite(c)`。
+  - 语义变化：`pendingBytes` 从此只承担限流职责，`wbuf` 是写调度的唯一真相源（与"全帧原子写入"的不变量一致）。
+- **附**：`submitSend` / PING 分支都运行在 reactor 线程上，`arm` 与 `disarm` 的调用点因此**全部串行**（`processPending` 与 `handleWrite` 都在同一 loop 里），所以 `writeArmed` 用普通 `bool` 而非原子量是安全的——这一点已写进 `Conn` 字段注释。
 
 ### [P1-2] 关闭连接时 `wbuf` 中被丢弃的字节未回退 `pendingBytes` → 发送队列水位只增不减
 
