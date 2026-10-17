@@ -60,6 +60,12 @@ int eventfd(unsigned int initval, int flags);
 #define SO_REUSEADDR 2
 #define SO_REUSEPORT 15
 #define SO_KEEPALIVE 9
+#define SO_LINGER 13
+#define SO_RCVTIMEO 20
+#define SHUT_RD 0
+#define SHUT_WR 1
+#define SHUT_RDWR 2
+#define INADDR_LOOPBACK 0x7F000001u
 #define IPPROTO_TCP 6
 #define IPPROTO_IPV6 41
 #define IPV6_V6ONLY 26
@@ -76,6 +82,22 @@ int eventfd(unsigned int initval, int flags);
 
 struct sockaddr { unsigned short sa_family; char sa_data[14]; };
 struct sockaddr_storage { unsigned short ss_family; char __pad[126]; };
+
+// <netinet/in.h>
+struct in_addr { unsigned int s_addr; };
+struct sockaddr_in {
+    short          sin_family;
+    unsigned short sin_port;
+    struct in_addr sin_addr;
+    char           sin_zero[8];
+};
+unsigned short htons(unsigned short v);
+unsigned short ntohs(unsigned short v);
+unsigned int   htonl(unsigned int v);
+unsigned int   ntohl(unsigned int v);
+
+// <sys/socket.h> SO_LINGER payload: l_onoff=1,l_linger=0 asks for RST on close.
+struct linger { int l_onoff; int l_linger; };
 
 struct iovec { void* iov_base; size_t iov_len; };
 
@@ -102,7 +124,10 @@ struct addrinfo {
 
 extern "C" {
 int socket(int domain, int type, int protocol);
+int connect(int sockfd, const struct sockaddr* addr, socklen_t addrlen);
 int bind(int sockfd, const struct sockaddr* addr, socklen_t addrlen);
+int getsockname(int sockfd, struct sockaddr* addr, socklen_t* addrlen);
+ssize_t send(int sockfd, const void* buf, size_t len, int flags);
 int listen(int sockfd, int backlog);
 int accept4(int sockfd, struct sockaddr* addr, socklen_t* addrlen, int flags);
 int setsockopt(int sockfd, int level, int optname, const void* optval, socklen_t optlen);
@@ -112,6 +137,7 @@ int getnameinfo(const struct sockaddr* addr, socklen_t addrlen, char* host, sock
                 char* serv, socklen_t servlen, int flags);
 ssize_t sendmsg(int sockfd, const struct msghdr* msg, int flags);
 ssize_t recv(int sockfd, void* buf, size_t len, int flags);
+int shutdown(int sockfd, int how);
 int close(int fd);
 ssize_t read(int fd, void* buf, size_t count);
 ssize_t write(int fd, const void* buf, size_t count);

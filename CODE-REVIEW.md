@@ -149,9 +149,9 @@
   - `onConnectionOpened` 失败分支补上 `epoll_ctl(DEL)`（通过新抽出的 `unregisterConn()`），并补 `rejected++`。
   - 结果：`accepted` 与 `rejected` 互斥，`accepted - closed == 在线连接数` 重新成立。
 
-### [P1-4] 优雅关闭未 `shutdown(SHUT_WR)`：业务应答可能被丢弃；错误路径还直接 RST
+### [P1-4] 优雅关闭未 `shutdown(SHUT_WR)`：业务应答可能被丢弃；错误路径还直接 RST　✅ 已修复（commit 待填）
 
-- **位置**：`closeConn` L802-807（`epoll_ctl(DEL)` 紧接 `::close`）
+- **位置**：`closeConn`（原 L802-807，`epoll_ctl(DEL)` 紧接 `::close`）
 - **缺陷模式**：D-02 上下文丢失（协议层语义）
 - **机理**：两件事。
   1. **无半关闭**：业务侧常见模式是"处理完 → `sendTo` → `closeConnection`"，两步都在同一线程入队。`closeConnection` 的任务可能先于 `sendTo` 的任务执行（不同任务、同一个 pending 队列，顺序**不保证**——`sendTo` 先入队所以通常在前，但 `closeConnection` 从别的线程来就完全可能超前）。一旦 `closeConn` 先跑，被 close 的 socket 里未发出的字节直接丢弃。
@@ -160,6 +160,19 @@
   - 新增 `SendResult`/状态：`ShutdownWrite`（只 `shutdown(fd, SHUT_WR)`，保留读侧排空、等 `EPOLLIN` 读到 EOF 再 close）；
   - `closeConn` 增加 `bool graceful` 形参：graceful 路径先 `discard rbuf` → `flush wbuf`（尽力而为）→ `shutdown(SHUT_WR)` → 标记 `halfClosed`，等对端 FIN 或 5s 超时再真正 close；
   - 非 graceful 路径（bad magic / 帧过大 / 安全原因）才允许直接 close，并在 close 前 `setsockopt(SO_LINGER{1,0})` 让 RST 语义显式化，而不是碰运气。
+- **已落地（commit 待填）**：
+  - **关闭分两条路**：`closeConn(c, reason, graceful = true)`。默认 graceful（业务 `closeConnection`、对端 FIN、空闲超时），协议违规/资源耗尽/故障路径显式传 `false`（`bad magic`、`frame too large`、`rbuf full`、`recv error`、`send error`、`epoll ctl` 失败、`hup/err`、`wbuf full on pong`、`scratch too small`、`close linger expired`、`server shutdown`）。
+  - **新增 `Conn::closing` / `Conn::finSent` 两个状态位**，与 `isClosed` 分离——这是这条修复的核心：
+    - `closing`：graceful 关闭已受理但 socket 还在。`submitSend` 与 PING 分支拒收新帧（否则会排到 FIN 之后），**但已入队的应答仍然入 wbuf**（`submitClose` 只标记 + 返回，回到 `processPending` 后同批次的 `sendTo` 任务先跑）。
+    - `finSent`：`shutdown(SHUT_WR)` 已调用。`closeConn` 依据它区分"停靠"与"真正拆除"，因此关闭是幂等的。
+  - **`parkClose()` 的顺序不可交换**：先把 wbuf drain 进内核，再 `shutdown(SHUT_WR)`。`shutdown` 会立刻关掉内核发送方向，wbuf 里没交出去的用户态字节会直接丢；反过来，内核在 FIN 之前会按序发完已接受的字节。wbuf 未排空时只 `armWrite()`，由 `handleWrite` 排空后补发 FIN。
+  - **socket 真正 `close()` 的时机**：等到 `recv` 返回 0（对端 FIN）后立刻关；对端不发 FIN 则由 `doTick()` 在 `closeLingerMs`（默认 5000ms）后强制结束，并计入 `aborted`。等待期间连接仍可读，`lastRecvMs` 不参与判定（半关闭的对端不会再发数据）。
+  - **`recv` 返回 0 时的修补**：对端 FIN 到达但 `wbuf` 非空时不再直接 `closeConn`（那正是"请求已处理、应答没发出"的场景），而是停靠关闭，等 FIN 与应答一起出去。
+  - **RST 语义显式化**：只有 `graceful == false` 才 `setsockopt(SO_LINGER{1,0})`；正常关闭不设 linger（设了会把每个正常关闭都变成 RST）。新增 `ServerStats::aborted` 区分强制断开。
+  - **新增 `ServerStats::framesDroppedOnClose`**：`closing` 期间拒收的帧（PING 回 PONG、以及 `submitSend` 在 `closing` 状态下拒收的帧）单独计数，`pendingBytes` 同步回退，避免 P1-2 修好的三段式账目再次漏水。
+  - **`drainWbufToSocket` 的 `EPIPE` 分流**：写方向已关闭时 `EPIPE` 不等于"连接坏了"，返回 0（已排空）让调用方走 FIN 收尾，而不是升级成 RST。
+  - **一个没做的取舍**：配置项叫 `closeLingerMs`（关闭宽限期），不是 `SO_LINGER` 的 `l_linger`。两者很容易被混淆，注释里已写明 `SO_LINGER` 只用于 abort。
+- **未覆盖**：`SO_LINGER` 的 `l_linger` 与 TIME_WAIT 压缩（`INDUSTRIAL_TCP_LINGER_S` 宏已定义但当前未使用）留到 P2-3 一并处理；`SO_REUSEADDR` 已开，重绑端口不受影响。
 
 ### [P1-5] 生产代码里残留测试后门开关，且目录中没有任何测试
 
@@ -259,7 +272,7 @@
 | P1-2 | 关闭时 wbuf 残留不回退 `pendingBytes` | ✅ | `3db4521` |
 | P1-3 | `accepted` 计数口径与 `rejected` 冲突 | ✅ | `bcd2ead` |
 | P2-1 | 注册失败回滚不完整 | ✅ | `bcd2ead` |
-| P1-4 | 缺 `shutdown(SHUT_WR)` 优雅关闭 | ⬜ 待做 | — |
+| P1-4 | 缺 `shutdown(SHUT_WR)` 优雅关闭 | ✅ | 见下 |
 | P1-5 | 无测试、故障注入开关无消费者 | ⬜ 待做 | — |
 | P2-2 | `sendTo` 双锁 + `pendingBytes` 内存序论证不成立 | ⬜ 待做 | — |
 | P2-3 | rlimit 只告警不动作 | ⬜ 待做 | — |

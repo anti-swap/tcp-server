@@ -32,15 +32,28 @@ if [ ! -x "$CXX" ]; then
   exit 2
 fi
 
-flags=(-std=c++17 -c -Wall -Wextra -Wpedantic -Wshadow -I "$HERE_W/stub")
-out="$HERE_W/compile_check.o"
+flags=(-std=c++17 -c -Wall -Wextra -Wpedantic -Wshadow -D__linux__ -I "$HERE_W/stub")
 
 echo "== compiling $(basename "$root")/tcp-server-mt.h =="
-if ! "$CXX" "${flags[@]}" "$HERE_W/compile_check.cpp" -o "$out" 2>&1; then
+if ! "$CXX" "${flags[@]}" "$HERE_W/compile_check.cpp" -o "$HERE_W/compile_check.o" 2>&1; then
   echo "build.sh: FAILED" >&2
   rm -f "$here/compile_check.o"
   exit 1
 fi
-
 rm -f "$here/compile_check.o"
+
+# The runtime test is compiled too (never linked or run here): it includes the
+# header from a second translation unit and exercises APIs the trivial checker
+# does not, so it catches interface drift -- e.g. a renamed public method -- that
+# compile_check.cpp would happily keep compiling.
+if [ -f "$here/close_semantics.cpp" ]; then
+  echo "== compiling $(basename "$root")/verify/close_semantics.cpp =="
+  if ! "$CXX" "${flags[@]}" "$HERE_W/close_semantics.cpp" -o "$HERE_W/close_semantics.o" 2>&1; then
+    echo "build.sh: FAILED" >&2
+    rm -f "$here/close_semantics.o"
+    exit 1
+  fi
+  rm -f "$here/close_semantics.o"
+fi
+
 echo "build.sh: OK (no warnings)"

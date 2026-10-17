@@ -46,6 +46,16 @@ constexpr uint16_t FRAME_MAGIC       = 0xEB90;
 constexpr size_t   FRAME_HEADER_SIZE = 8;
 constexpr uint32_t MAX_FRAME_PAYLOAD = 64 * 1024;
 
+// How long a peer may linger in TIME_WAIT holding a descriptor of ours. Without
+// it the kernel keeps the peer's address (and our fd slot) for 60s after we
+// close first, which is enough to exhaust a low RLIMIT_NOFILE under churn. This
+// affects the state's lifetime only, never whether the close itself is an
+// orderly FIN or an RST -- SO_LINGER decides that, and we never set it except on
+// the explicit abort path.
+#ifndef INDUSTRIAL_TCP_LINGER_S
+#define INDUSTRIAL_TCP_LINGER_S 1
+#endif
+
 enum class FrameType : uint16_t {
     DATA = 0x0001,
     PING = 0x0002,
@@ -185,6 +195,8 @@ struct ServerStats {
     std::atomic<uint64_t> bytesSent{0};
     std::atomic<uint64_t> queueDrops{0};       // 全帧入队被拒次数
     std::atomic<uint64_t> bytesDropped{0};     // 连接关闭时被丢弃的待发字节
+    std::atomic<uint64_t> aborted{0};          // 强制断开（RST）次数，区别于 shutdown 后正常关闭
+    std::atomic<uint64_t> framesDroppedOnClose{0};  // 已在关闭流程中、因 FIN 已发而丢弃的待发帧
     std::atomic<uint64_t> parseErrors{0};
     std::atomic<uint64_t> idleTimeouts{0};
     std::atomic<uint64_t> epollCtlErrors{0};
@@ -234,6 +246,19 @@ struct Conn {
     // epoll_ctl calls, so a stale EPOLLOUT event cannot tear down a live write
     // interest (and a queued frame cannot be stranded without a wakeup).
     bool       writeArmed = false;
+    // -------- close protocol --------
+    // closing: a graceful close has been requested and is being honoured (output
+    //          drained, FIN sent or imminent). Submissions are refused from here
+    //          on, but the peer keeps reading what we owe it.
+    // finSent: FIN has actually left. Closing before that would drop queued bytes
+    //          and turn the polite close into the RST this whole mechanism avoids.
+    // The two are separate on purpose: "closed" must not mean "socket is gone",
+    // or an application that sends a reply and then closes would never get the
+    // reply out. Reads keep running throughout.
+    bool       closing = false;
+    bool       finSent = false;
+    int64_t    closeStartedAtMs = 0;   // when the graceful close was parked
+    int64_t    finSentAtMs = 0;        // when shutdown(SHUT_WR) returned
     const char* closeReason = nullptr;
 
     // 跨线程
@@ -280,8 +305,21 @@ private:
     void handleRead(Conn* c) noexcept;
     void handleWrite(Conn* c) noexcept;
     void parseFrames(Conn* c, int& framesLeft) noexcept;
-    void closeConn(Conn* c, const char* reason) noexcept;
-    void unregisterConn(Conn* c) noexcept;
+    // graceful=true: whatever we still owe the peer is delivered before the FIN,
+    //                and the socket is closed only after the peer's own FIN (or
+    //                closeLingerMs). Use it whenever the peer is a legitimate
+    //                counterparty that should not lose its last reply.
+    // graceful=false: abort now -- pending output is dropped and an RST is
+    //                requested. For protocol violations, resource exhaustion and
+    //                fault paths, where delivering a half-processed stream would
+    //                be worse than the reset.
+    // Default graceful=true: see the definition for what the two modes mean.
+    void closeConn(Conn* c, const char* reason, bool graceful = true) noexcept;
+    void teardownClosed(Conn* c, const char* reason, bool graceful) noexcept;
+    void parkClose(Conn* c, const char* reason) noexcept;
+    bool tryBeginWriteShutdown(Conn* c) noexcept;
+    void finishPeerClosed(Conn* c, bool inputDrained) noexcept;
+    void unregisterConn(Conn* c, bool graceful = true) noexcept;
     void discardPendingOutput(Conn* c) noexcept;
     void finishClose(std::shared_ptr<Conn>& c) noexcept;
     void flushCloseCallbacks() noexcept;
@@ -350,6 +388,10 @@ public:
         size_t      wbufCapacity    = 256 * 1024;   // 256KB
         size_t      maxPendingBytes = 256 * 1024;   // <= wbufCapacity
         size_t      writeBudgetBytes = 256 * 1024;
+        // Grace period for a half-closed connection: after our FIN went out we
+        // keep reading until the peer's FIN, but never longer than this. Bounds
+        // the descriptor cost of a peer that ACKs the FIN and never answers it.
+        int         closeLingerMs    = 5000;
     };
 
     explicit MultiReactorServer(Config cfg) noexcept : cfg_(std::move(cfg)) {}
@@ -393,6 +435,7 @@ public:
     }
     int    tickMs() const noexcept { return cfg_.tickMs; }
     int    idleTimeoutMs() const noexcept { return cfg_.idleTimeoutMs; }
+    int    closeLingerMs() const noexcept { return cfg_.closeLingerMs; }
     size_t rbufCapacity() const noexcept { return cfg_.rbufCapacity; }
     size_t wbufCapacity() const noexcept { return cfg_.wbufCapacity; }
     ServerStats&      statsRef()          noexcept { return stats_; }
@@ -522,10 +565,14 @@ inline void SubReactor::cleanup() noexcept {
     }
 
     while (!conns_.empty()) {
+        // Shutdown cannot wait out anyone's half-close -- the reactor is leaving
+        // and there is no thread left to deliver a parked connection's last
+        // bytes. Abort explicitly, and account the undelivered bytes as drops
+        // rather than pretending they went out.
         std::shared_ptr<Conn> c = conns_.begin()->second;
         Conn* raw = c.get();
         c.reset();
-        closeConn(raw, "server shutdown");
+        closeConn(raw, "server shutdown", false);
     }
     flushCloseCallbacks();
     activeTasks_.clear();
@@ -653,7 +700,19 @@ inline bool SubReactor::submitSend(uint64_t id,
             auto it = conns_.find(id);
             if (it == conns_.end()) return;
             Conn* c = it->second.get();
-            if (c->isClosed.load(std::memory_order_acquire)) return;
+            // A parked close still accepts the reply that was queued before it:
+            // submitClose only marks the connection and then returns to this batch,
+            // so this task runs first. Anything arriving after that point is
+            // refused here -- the FIN is already reserved for what we owe the peer.
+            if (c->isClosed.load(std::memory_order_acquire) || c->closing) {
+                c->pendingBytes.fetch_sub(f.size(), std::memory_order_acq_rel);
+                if (c->closing)
+                    server_->statsRef().bytesDropped.fetch_add(f.size(),
+                                                               std::memory_order_relaxed);
+                else
+                    server_->statsRef().queueDrops.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
 
             // 全帧原子写入：容量不足则整帧丢弃（不破坏帧流）
             if (c->wbuf.writable() < f.size()) {
@@ -685,6 +744,8 @@ inline bool SubReactor::submitClose(uint64_t id) noexcept {
             if (it != conns_.end()) {
                 // Copy out and reset the map handle before closing: the deferred
                 // close callbacks must not run while this frame holds the conn.
+                // Default (graceful): this is an application-level "we are done",
+                // so the reply queued just before it must still reach the peer.
                 std::shared_ptr<Conn> c = it->second;
                 Conn* raw = c.get();
                 c.reset();
@@ -714,19 +775,23 @@ inline void SubReactor::armWrite(Conn* c) noexcept {
         }
     }
     server_->statsRef().epollCtlErrors.fetch_add(1, std::memory_order_relaxed);
-    closeConn(c, "epoll write registration failed");
+    closeConn(c, "epoll write registration failed", false);
 }
 
 inline void SubReactor::disarmWrite(Conn* c) noexcept {
-    if (!c->writeArmed) return;
+    // Targeted on the EPOLLOUT bit, not on an "armed" flag: after our FIN the
+    // write interest is gone but writeArmed is still true, and forgetting to
+    // clear EPOLLOUT there would make a half-closed connection spin on a
+    // level-triggered event it can never consume.
+    if (!c->writeArmed || c->fd < 0) return;
     // Still has bytes to flush: keep the interest instead of undoing a preceding
     // armWrite. The caller is responsible for retrying the drain.
-    if (!c->wbuf.empty() || c->fd < 0) return;
+    if (!c->wbuf.empty()) return;
     struct epoll_event ev{};
     ev.events = EPOLLIN; ev.data.fd = c->fd;
     if (epoll_ctl(epollFd_, EPOLL_CTL_MOD, c->fd, &ev) < 0 && errno != ENOENT) {
         server_->statsRef().epollCtlErrors.fetch_add(1, std::memory_order_relaxed);
-        closeConn(c, "epoll read registration failed");
+        closeConn(c, "epoll read registration failed", false);
         return;
     }
     c->writeArmed = false;
@@ -751,6 +816,10 @@ inline int SubReactor::drainWbufToSocket(Conn* c) noexcept {
         if (k < 0) {
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) return 1;
+            // EPIPE means the local write side is already shut down, so there is
+            // nothing left to deliver and nothing worth resetting: stop here and
+            // let the caller finish the half-close instead of escalating to RST.
+            if (errno == EPIPE) return 0;
             return -1;
         }
         if (k == 0) return -1;
@@ -782,7 +851,7 @@ inline void SubReactor::handleRead(Conn* c) noexcept {
 
         if (c->rbuf.writable() == 0) {
             // 解析后仍满 → 半包过大，断开
-            closeConn(c, "rbuf full with incomplete frame");
+            closeConn(c, "rbuf full with incomplete frame", false);
             return;
         }
 
@@ -793,22 +862,75 @@ inline void SubReactor::handleRead(Conn* c) noexcept {
             bytesLeft -= (int)n;
             server_->statsRef().bytesRecv.fetch_add((uint64_t)n, std::memory_order_relaxed);
         } else if (n == 0) {
-            closeConn(c, "peer closed"); return;
+            // Peer's FIN. If we still owe it a reply, closing here would turn the
+            // last answer into an RST -- the client asked, we processed, and it
+            // never sees the result. Park the close instead where we can: after
+            // our own half-close, or (for an application close) with the FIN to
+            // go out once wbuf drains.
+            parseFrames(c, framesLeft);
+            if (c->isClosed.load(std::memory_order_acquire)) return;
+            finishPeerClosed(c, framesLeft == 0);
+            return;
         } else {
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 parseFrames(c, framesLeft);  // 再解析一次
                 return;
             }
-            closeConn(c, "recv error"); return;
+            closeConn(c, "recv error", false); return;
         }
     }
 }
 
 inline void SubReactor::handleWrite(Conn* c) noexcept {
+    // Past our FIN there is nothing left to write, and the EPOLLOUT bit is kept
+    // clear, so an event arriving here is stale: just make sure it is off.
+    if (c->finSent) { disarmWrite(c); return; }
     int r = drainWbufToSocket(c);
-    if (r < 0) { closeConn(c, "send error"); return; }
-    if (r == 0) disarmWrite(c);
+    if (r < 0) { closeConn(c, "send error", false); return; }
+    if (!c->wbuf.empty()) return;   // fair-share budget or EAGAIN: EPOLLOUT refires
+
+    // wbuf is empty, so anything owed to the peer has reached the kernel: this is
+    // the only place a FIN may be sent. A non-closing connection just drops its
+    // write interest here; a parked close turns into a half-close.
+    disarmWrite(c);
+    if (c->closing && !tryBeginWriteShutdown(c)) {
+        // shutdown() failed on a socket that was writable a moment ago: the only
+        // way left to end this connection is a reset, which is at least honest.
+        teardownClosed(c, "shutdown failed", false);
+    }
+}
+
+// Sends FIN and records it. Reads stay armed: the connection is now waiting for
+// the peer's own FIN (or closeLingerMs, enforced by doTick).
+inline bool SubReactor::tryBeginWriteShutdown(Conn* c) noexcept {
+    if (c->finSent || c->fd < 0) return c->finSent;
+    // Never FIN over bytes still in wbuf: they would be lost, and the peer would
+    // see a clean end to a truncated stream.
+    if (!c->wbuf.empty()) return false;
+    if (::shutdown(c->fd, SHUT_WR) < 0) return false;
+    c->finSent = true;
+    c->finSentAtMs = nowMs();
+    return true;
+}
+
+// The peer has finished sending (recv returned 0, or a zero-byte read surfaced
+// through the deferred path). `inputDrained` says parseFrames can make no further
+// progress, which is the precondition for answering with a FIN: any complete
+// frame still buffered is a request that has been served but whose reply has not
+// been queued yet (the handler runs from rbuf, so those frames are not lost --
+// but FIN-ing first would make the queued reply illegal to write).
+inline void SubReactor::finishPeerClosed(Conn* c, bool inputDrained) noexcept {
+    if (c->isClosed.load(std::memory_order_acquire)) return;
+    if (!inputDrained) return;          // the read continuation calls us again
+    if (!c->wbuf.empty()) return;       // parked close finishes in handleWrite
+    if (c->closing && !c->finSent) {
+        // Still closing on our side and the peer declared itself done too: the
+        // only thing left is the FIN. Anything a handler queued was drained above
+        // or is still passing through the socket buffer, ahead of it.
+        if (!tryBeginWriteShutdown(c)) { teardownClosed(c, "peer closed", false); return; }
+    }
+    teardownClosed(c, "peer closed", true);
 }
 
 inline void SubReactor::parseFrames(Conn* c, int& framesLeft) noexcept {
@@ -818,14 +940,14 @@ inline void SubReactor::parseFrames(Conn* c, int& framesLeft) noexcept {
         uint16_t magic = (uint16_t(hdr[0]) << 8) | hdr[1];
         if (magic != FRAME_MAGIC) {
             server_->statsRef().parseErrors.fetch_add(1, std::memory_order_relaxed);
-            closeConn(c, "bad magic"); return;
+            closeConn(c, "bad magic", false); return;
         }
         FrameType type = static_cast<FrameType>((uint16_t(hdr[2]) << 8) | hdr[3]);
         uint32_t len = (uint32_t(hdr[4]) << 24) | (uint32_t(hdr[5]) << 16) |
                        (uint32_t(hdr[6]) <<  8) |  uint32_t(hdr[7]);
         if (len > MAX_FRAME_PAYLOAD) {
             server_->statsRef().parseErrors.fetch_add(1, std::memory_order_relaxed);
-            closeConn(c, "frame too large"); return;
+            closeConn(c, "frame too large", false); return;
         }
         if (c->rbuf.readable() < FRAME_HEADER_SIZE + len) return;  // 半包，等更多
 
@@ -848,7 +970,18 @@ inline void SubReactor::parseFrames(Conn* c, int& framesLeft) noexcept {
             if (!reserved || c->wbuf.writable() < pong.size()) {
                 if (reserved) c->pendingBytes.fetch_sub(pong.size());
                 // 全帧规则同样适用：PONG 发不出去 → 对端长期不读，断开
-                closeConn(c, "wbuf full on pong"); return;
+                // 强制断开：对端已经没有接收能力，再排空只是拖长描述符占用。
+                closeConn(c, "wbuf full on pong", false); return;
+            }
+            if (c->closing) {
+                // Mid-close: the FIN is already (or about to be) behind everything
+                // we owe the peer. Queueing a PONG after it would either be sent
+                // past the FIN -- which the kernel refuses -- or silently lost.
+                // The peer is entitled to nothing more than the reply it asked for.
+                c->pendingBytes.fetch_sub(pong.size(), std::memory_order_relaxed);
+                server_->statsRef().framesDroppedOnClose.fetch_add(1, std::memory_order_relaxed);
+                c->rbuf.consume(len);
+                continue;
             }
             c->wbuf.write(pong.data(), pong.size());
             server_->statsRef().framesSent.fetch_add(1, std::memory_order_relaxed);
@@ -862,7 +995,7 @@ inline void SubReactor::parseFrames(Conn* c, int& framesLeft) noexcept {
         } else {
             if (len > 0) {
                 if (len > frameScratch_.size()) {
-                    closeConn(c, "scratch too small"); return;
+                    closeConn(c, "scratch too small", false); return;
                 }
                 c->rbuf.peek(frameScratch_.data(), len);
             }
@@ -878,13 +1011,27 @@ inline void SubReactor::parseFrames(Conn* c, int& framesLeft) noexcept {
 // closed the descriptor but left the epoll registration behind, so a recycled fd
 // number could arrive with stale interest attached. Every abort/close path goes
 // through here so those three steps can never drift apart again.
-inline void SubReactor::unregisterConn(Conn* c) noexcept {
+//
+// graceful decides one thing only: whether the close asks for an RST. An orderly
+// close relies on the FIN that the caller already sent via shutdown(SHUT_WR).
+inline void SubReactor::unregisterConn(Conn* c, bool graceful) noexcept {
     if (c->fd < 0) return;
+    // An abort asks for the reset explicitly instead of relying on whatever the
+    // close() picks: SO_LINGER{1,0} drops the send buffer and sends RST. It is
+    // set on abort only -- never on close normally, or every orderly close would
+    // become a reset.
+    if (!graceful) {
+        struct linger lg{};
+        lg.l_onoff  = 1;
+        lg.l_linger = 0;
+        setsockopt(c->fd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+    }
     fdIndex_.erase(c->fd);
     epoll_ctl(epollFd_, EPOLL_CTL_DEL, c->fd, nullptr);
     ::close(c->fd);
     c->fd = -1;
     c->writeArmed = false;
+    c->closing  = false;
 }
 
 // pendingBytes is reserved at enqueue time and released on two paths only:
@@ -908,7 +1055,8 @@ inline void SubReactor::discardPendingOutput(Conn* c) noexcept {
 // Close is split in two on purpose. closeConn() only does the work that is safe
 // to do inside a handler stack frame: unlist, detach the descriptor, drop both
 // maps' references, bump counters. It never destroys the connection (the caller
-// holds a shared_ptr) and never invokes user callbacks.
+// holds a shared_ptr) and never invokes user callbacks. A graceful close is not
+// even that much: it parks the connection and may not unlist it for a while.
 //
 // USER CALLBACKS ARE DEFERRED. ConnStateHandler(false) / CloseHandler may call
 // stop() (allowed) or release the last external owner of MultiReactorServer; if
@@ -916,18 +1064,67 @@ inline void SubReactor::discardPendingOutput(Conn* c) noexcept {
 // reactor in particular, since cleanup()/stop() continue running from closeConn.
 // flushCloseCallbacks() drains them from a frame that owns no reference to the
 // closed connection, after the caller's keepAlive is gone.
-inline void SubReactor::closeConn(Conn* c, const char* reason) noexcept {
+//
+// Two ways out of a connection, and the difference is visible on the wire:
+//   closeConn(..., graceful=true)  -- default. Called when the peer, the
+//       application or the server asked to end an otherwise healthy connection.
+//       Everything owed to the peer is delivered first: see parkClose().
+//   closeConn(..., graceful=false) -- abort. Pending output is dropped and
+//       SO_LINGER{on,0} asks the kernel for an RST, so the peer cannot mistake a
+//       half-processed stream for a complete one.
+inline void SubReactor::closeConn(Conn* c, const char* reason, bool graceful) noexcept {
+    // A graceful close of a live connection is parked; one that has already sent
+    // its FIN (or is aborted) is torn down right here.
+    if (graceful && !c->finSent) { parkClose(c, reason); return; }
+    teardownClosed(c, reason, graceful);
+}
+
+// Why the close cannot simply be "write what is queued, then close":
+//   1. wbuf lives in user space. shutdown() takes effect immediately and closes
+//      the kernel's send direction, so anything still in wbuf when it is called
+//      is lost for good.
+//   2. close() on a socket whose peer data is unread sends RST and discards the
+//      queued output. The peer's last request is often still unread here.
+// So: drain wbuf into the kernel first, then shutdown(SHUT_WR); the kernel keeps
+// delivering what it already accepted, in order, before the FIN. The socket is
+// closed only after the peer's FIN arrives (doTick bounds the wait).
+//
+// A graceful close while the connection is still alive on the wire. Until the
+// peer has seen both everything we owed it and our FIN the connection is marked
+// `closing`, so no further submissions are accepted -- but the reply queued just
+// before the close still is (see submitSend).
+//
+// Idempotent: a second close request (or an idle-timeout sweep firing while the
+// first FIN is still in flight) must not restart the drain or skip it.
+inline void SubReactor::parkClose(Conn* c, const char* reason) noexcept {
+    if (c->isClosed.load(std::memory_order_acquire) || c->finSent) return;
+    if (!c->closing) { c->closing = true; c->closeStartedAtMs = nowMs(); }
+    // Hand over what is already queued; whatever does not fit in the socket
+    // buffer stays in wbuf and is finished by handleWrite (EPOLLOUT armed).
+    int r = drainWbufToSocket(c);
+    if (r < 0) { teardownClosed(c, reason, false); return; }
+    if (!c->wbuf.empty()) { armWrite(c); return; }
+    // wbuf empty: either every byte is in the socket buffer, or sendmsg stopped
+    // exactly on the budget boundary. In both cases nothing more can be queued
+    // (`closing` refuses submissions), so the FIN goes out now.
+    tryBeginWriteShutdown(c);
+}
+
+// Unlist -> detach descriptor -> account -> queue deferred callbacks. Shared by
+// the graceful and abort exits so the two can never disagree on counters.
+// `graceful=false` closes with SO_LINGER{on,0}: an explicit RST instead of the
+// FIN default, so a peer is never handed a truncated stream that looks complete.
+inline void SubReactor::teardownClosed(Conn* c, const char* reason, bool graceful) noexcept {
     bool expected = false;
     if (!c->isClosed.compare_exchange_strong(expected, true,
                                              std::memory_order_acq_rel))
         return;
     c->closeReason = reason;
     unscheduleRead(c);
-    // The socket is going away, so whatever this connection still owed is now
-    // undeliverable. Reconcile the byte reservation with the buffer that backs
-    // it; otherwise pendingBytes never drains for this connection and any
-    // watermark derived from it (or from an aggregate) silently leaks.
-    // Accounted before the close so a close callback reading stats sees it.
+    // Anything still in wbuf will never be sent. Reconcile the byte reservation
+    // with the buffer that backs it, or pendingBytes never drains for this
+    // connection and any watermark derived from it leaks. Accounted before the
+    // close so a close callback reading stats sees it.
     discardPendingOutput(c);
 
     std::shared_ptr<Conn> keepAlive;
@@ -935,9 +1132,10 @@ inline void SubReactor::closeConn(Conn* c, const char* reason) noexcept {
         auto it = conns_.find(c->id);
         if (it != conns_.end()) { keepAlive = it->second; conns_.erase(it); }
     }
-    unregisterConn(c);   // fdIndex_ erase + EPOLL_CTL_DEL + close + fd = -1
+    unregisterConn(c, graceful);   // fdIndex_ erase + EPOLL_CTL_DEL + close + fd = -1
 
     server_->statsRef().closed.fetch_add(1, std::memory_order_relaxed);
+    if (!graceful) server_->statsRef().aborted.fetch_add(1, std::memory_order_relaxed);
     server_->onConnectionClosed(c->id);
     c->admission.reset();
 
@@ -1004,14 +1202,34 @@ inline void SubReactor::unscheduleRead(Conn* c) noexcept {
 }
 
 inline void SubReactor::doTick() noexcept {
-    int64_t cutoff = nowMs() - server_->idleTimeoutMs();
-    for (auto it = conns_.begin(); it != conns_.end();) {
-        auto c = (it++)->second;
+    const int64_t now   = nowMs();
+    const int64_t cutoff = now - server_->idleTimeoutMs();
+    const int64_t linger = server_->closeLingerMs();
+    std::vector<std::shared_ptr<Conn>> expired;
+    for (auto& kv : conns_) {
+        Conn* c = kv.second.get();
+        if (c->closing) {
+            // A closing connection has a deadline regardless of which stage it
+            // reached, and it is the same value for both: how long the close may
+            // take. lastRecvMs is useless here (the peer has nothing left to
+            // send), so measure from the close itself; parkClose stamps
+            // closeStartedAtMs before any of the stages that can stall.
+            if (linger > 0 && c->fd >= 0 && c->closeStartedAtMs != 0 &&
+                now - c->closeStartedAtMs >= linger)
+                expired.push_back(kv.second);
+            continue;
+        }
         if (c->lastRecvMs < cutoff) {
             server_->statsRef().idleTimeouts.fetch_add(1, std::memory_order_relaxed);
-            closeConn(c.get(), "idle timeout");
+            // Default (graceful): an idle connection is still a legitimate peer
+            // and may hold a half-finished exchange, so let the close park until
+            // what we owe it is out.
+            closeConn(c, "idle timeout");
         }
     }
+    // Forced close of parked connections happens after the sweep: closeConn
+    // erases from conns_, which would invalidate the iterator above.
+    for (auto& c : expired) closeConn(c.get(), "close linger expired", false);
 }
 
 inline void SubReactor::loop() noexcept {
@@ -1058,7 +1276,11 @@ inline void SubReactor::loop() noexcept {
                 }
                 if (!keepAlive) continue;
 
-                if (ev & (EPOLLHUP | EPOLLERR)) { closeConn(c, "hup/err"); continue; }
+                // HUP/ERR is the kernel telling us the socket is already broken
+                // (or the peer is gone for good); draining into it cannot work.
+                // Abort so the peer is not left waiting on a stream that will
+                // never complete.
+                if (ev & (EPOLLHUP | EPOLLERR)) { closeConn(c, "hup/err", false); continue; }
                 if (ev & EPOLLIN) {
                     handleRead(c);
                     if (c->isClosed.load(std::memory_order_acquire)) continue;
