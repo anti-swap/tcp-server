@@ -376,7 +376,23 @@ private:
     std::atomic<bool> running_{false};
     std::thread       thread_;
 
-    static constexpr size_t kMaxPendingTasks = 8192;
+    // Queue cap, and it is **per reactor** -- which is a different number from
+    // "per server" in a way that matters. pickReactor() spreads submissions out,
+    // so a broadcast to 8k connections across 4 reactors asks each queue for 2k
+    // slots, not 8k; scaling this by the server's total connection count would
+    // be wrong in the other direction.
+    //
+    // What it does have to track is how many connections *this* reactor can be
+    // asked to serve, because that is what a broadcast costs. A flat 8192 looked
+    // generous until the box grew: past roughly that many connections one
+    // broadcast fills whichever queue it lands on, and everything queued after
+    // it is counted as queueDrops -- which reads as "the peers are not
+    // draining" rather than "a constant was picked before anyone knew the
+    // fan-out". Four frames of headroom per expected connection is enough for a
+    // reply plus a close per broadcast, and the floor keeps small servers where
+    // they were.
+    static constexpr size_t kMinPendingTasks = 8192;
+    size_t pendingTaskCap_ = kMinPendingTasks;
     std::mutex                        pendingMutex_;
     std::vector<std::function<void()>> pendingTasks_;
     std::vector<std::function<void()>> activeTasks_;
@@ -574,9 +590,15 @@ inline bool SubReactor::start() noexcept {
         wakeFd_ = epollFd_ = -1; running_.store(false); return false;
     }
 
+    // Computed here rather than in the constructor: picking reactor count and
+    // connection ceiling are both decisions the server makes later, and this is
+    // the first point at which both are final.
+    const size_t share = static_cast<size_t>(server_->cfg_.maxConnections) /
+                         static_cast<size_t>(server_->cfg_.resolvedReactorCount());
+    pendingTaskCap_ = std::max(kMinPendingTasks, share * 4);
     try {
-        pendingTasks_.reserve(kMaxPendingTasks);
-        activeTasks_.reserve(kMaxPendingTasks);
+        pendingTasks_.reserve(pendingTaskCap_);
+        activeTasks_.reserve(pendingTaskCap_);
         frameScratch_.resize(MAX_FRAME_PAYLOAD);
     } catch (...) {
         ::close(wakeFd_); ::close(epollFd_);
@@ -666,7 +688,7 @@ inline void SubReactor::processPending() noexcept {
 inline bool SubReactor::enqueue(std::function<void()> task) noexcept {
     {
         std::lock_guard<std::mutex> lk(pendingMutex_);
-        if (!running_.load() || !server_->isRunning() || pendingTasks_.size() >= kMaxPendingTasks) {
+        if (!running_.load() || !server_->isRunning() || pendingTasks_.size() >= pendingTaskCap_) {
             server_->statsRef().queueDrops.fetch_add(1);
             return false;
         }
