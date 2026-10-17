@@ -35,6 +35,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <unordered_map>
 #include <vector>
 #include <array>
@@ -64,8 +65,9 @@ enum class FrameType : uint16_t {
 };
 
 inline int64_t nowMs() noexcept {
-    using namespace std::chrono;
-    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
 }
 
 // The header is eight bytes written big-endian, and from here on only this one
@@ -110,20 +112,27 @@ struct FdGuard {
     explicit FdGuard(int f) noexcept : fd(f) {}
     FdGuard(FdGuard&& o) noexcept : fd(o.fd) { o.fd = -1; }
     FdGuard& operator=(FdGuard&& o) noexcept {
-        if (this != &o) { reset(); fd = o.fd; o.fd = -1; }
+        if (this != &o) {
+            reset(); fd = o.fd; o.fd = -1;
+        }
         return *this;
     }
     FdGuard(const FdGuard&) = delete;
     FdGuard& operator=(const FdGuard&) = delete;
     ~FdGuard() { reset(); }
-    void reset(int f = -1) noexcept { if (fd >= 0) { ::close(fd); } fd = f; }
+    void reset(int f = -1) noexcept {
+        if (fd >= 0) {
+            ::close(fd);
+        }
+        fd = f;
+    }
     int  release() noexcept { int f = fd; fd = -1; return f; }
     explicit operator bool() const noexcept { return fd >= 0; }
 };
 
 // ==================== 环形缓冲 ====================
 class RingBuffer {
-public:
+ public:
     RingBuffer() noexcept = default;
     explicit RingBuffer(size_t cap) { init(cap); }
 
@@ -187,14 +196,16 @@ public:
         size_t first = std::min(size_, cap_ - head_);
         s.p1 = buf_.data() + head_;
         s.n1 = first;
-        if (size_ > first) { s.p2 = buf_.data(); s.n2 = size_ - first; s.count = 2; }
+        if (size_ > first) {
+            s.p2 = buf_.data(); s.n2 = size_ - first; s.count = 2;
+        }
         else s.count = 1;
         return s;
     }
 
     void clear() noexcept { head_ = 0; size_ = 0; }
 
-private:
+ private:
     std::vector<uint8_t> buf_;
     size_t cap_  = 0;
     size_t head_ = 0;
@@ -221,8 +232,8 @@ struct ServerStats {
     // accept4 因耗尽文件描述符而失败的次数。这是唯一能在启动时预测到的 accept
     // 失败，因此也必须可数：没有它，唯一的症状是"它不再接受连接了，且一语不发"。
     std::atomic<uint64_t> acceptErrors{0};
-    std::atomic<uint64_t> pendingTasksTotal{0};// 累计投递
-    std::atomic<uint64_t> pendingTasksDepth{0};// 当前队列深度（gauge）
+    std::atomic<uint64_t> pendingTasksTotal{0};  // 累计投递
+    std::atomic<uint64_t> pendingTasksDepth{0};  // 当前队列深度（gauge）
 };
 
 // ==================== 发送结果 ====================
@@ -312,20 +323,22 @@ struct Conn {
     // promise anyway: it is a best-effort ceiling, so reading a stale value
     // costs one refused frame, never correctness.
     std::atomic<size_t> pendingBytes{0};
-    bool readPending = false; // Worker-owned continuation after a parsing budget.
+    bool readPending = false;  // Worker-owned continuation after a parsing budget.
     Conn* readNext = nullptr;
     Conn* readPrev = nullptr;
     std::shared_ptr<Admission> admission;
 
     ~Conn() noexcept {
         // 兜底：只 close 一次。正常路径 closeConn 已置 fd=-1
-        if (fd >= 0) { ::close(fd); fd = -1; }
+        if (fd >= 0) {
+            ::close(fd); fd = -1;
+        }
     }
 };
 
 // ==================== SubReactor ====================
 class SubReactor {
-public:
+ public:
     SubReactor(int idx, MultiReactorServer* server) noexcept
         : idx_(idx), server_(server) {}
     ~SubReactor() noexcept { stop(); }
@@ -345,7 +358,7 @@ public:
 
     int idx() const noexcept { return idx_; }
 
-private:
+ private:
     void loop() noexcept;
     void wakeup() noexcept;
     void drainWakeup() noexcept;
@@ -437,7 +450,7 @@ private:
 
 // ==================== MultiReactorServer ====================
 class MultiReactorServer {
-public:
+ public:
     // Install handlers before start; never replace them while running. Handlers
     // run concurrently across workers and must not throw or destroy this server.
     // Message payload/peer/reason references are borrowed for the call only.
@@ -534,7 +547,7 @@ public:
     MessageHandler&   msgHandlerRef()     noexcept { return msgHandler_; }
     ConnStateHandler& stateHandlerRef()   noexcept { return stateHandler_; }
 
-private:
+ private:
     friend class SubReactor;
 
     // Lifecycle states. Only the thread holding lifecycleMutex_ moves the state
@@ -570,7 +583,7 @@ private:
     // Lifecycle calls are serialized; submissions hold their barrier only until
     // queued. stop releases it before joining so worker callbacks can finish.
     std::mutex lifecycleMutex_;
-    std::mutex acceptFdMutex_; // Covers publication, wake writes, and fd teardown.
+    std::mutex acceptFdMutex_;  // Covers publication, wake writes, and fd teardown.
     inline static thread_local MultiReactorServer* callbackServer_ = nullptr;
     struct CallbackScope {
         MultiReactorServer* previous;
@@ -602,11 +615,15 @@ inline bool SubReactor::start() noexcept {
     if (running_.exchange(true)) return true;
 
     epollFd_ = ::epoll_create1(EPOLL_CLOEXEC);
-    if (epollFd_ < 0) { running_.store(false); return false; }
+    if (epollFd_ < 0) {
+        running_.store(false); return false;
+    }
 
     wakeFd_ = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-    if (wakeFd_ < 0) { ::close(epollFd_); epollFd_ = -1;
-                       running_.store(false); return false; }
+    if (wakeFd_ < 0) {
+        ::close(epollFd_); epollFd_ = -1;
+        running_.store(false); return false;
+    }
 
     struct epoll_event ev{};
     ev.events = EPOLLIN; ev.data.fd = wakeFd_;
@@ -640,7 +657,9 @@ inline bool SubReactor::start() noexcept {
 }
 
 inline void SubReactor::stop() noexcept {
-    if (server_->callbackServer_ == server_) { server_->requestStop(); return; }
+    if (server_->callbackServer_ == server_) {
+        server_->requestStop(); return;
+    }
     {
         std::lock_guard<std::mutex> lk(pendingMutex_);
         running_.store(false);
@@ -649,8 +668,12 @@ inline void SubReactor::stop() noexcept {
     if (thread_.joinable()) thread_.join();
     cleanup();
     std::lock_guard<std::mutex> lk(pendingMutex_);
-    if (wakeFd_  >= 0) { ::close(wakeFd_);  wakeFd_  = -1; }
-    if (epollFd_ >= 0) { ::close(epollFd_); epollFd_ = -1; }
+    if (wakeFd_  >= 0) {
+        ::close(wakeFd_);  wakeFd_  = -1;
+    }
+    if (epollFd_ >= 0) {
+        ::close(epollFd_); epollFd_ = -1;
+    }
 }
 
 inline void SubReactor::cleanup() noexcept {
@@ -676,7 +699,6 @@ inline void SubReactor::cleanup() noexcept {
     activeTasks_.clear();
     conns_.clear();
     fdIndex_.clear();
-
 }
 
 inline void SubReactor::wakeup() noexcept {
@@ -728,12 +750,14 @@ inline bool SubReactor::enqueue(std::function<void()> task) noexcept {
     return true;
 }
 
-inline bool SubReactor::submitNewConnection(FdGuard fd, std::string peer,
-                                            uint64_t id, std::shared_ptr<Admission> admission) noexcept {
+inline bool SubReactor::submitNewConnection(
+        FdGuard fd, std::string peer, uint64_t id,
+        std::shared_ptr<Admission> admission) noexcept {
     std::function<void()> task;
     try {
         auto socket = std::make_shared<FdGuard>(std::move(fd));
-        task = [this, socket, admission = std::move(admission), peer = std::move(peer), id]() mutable noexcept {
+        task = [this, socket, admission = std::move(admission),
+                peer = std::move(peer), id]() mutable noexcept {
             try {
                 auto c = std::make_shared<Conn>();
                 c->id = id;
@@ -929,10 +953,11 @@ inline int SubReactor::drainWbufToSocket(Conn* c) noexcept {
             return -1;
         }
         if (k == 0) return -1;
-        c->wbuf.consume((size_t)k);
-        budget -= (size_t)k;
-        c->pendingBytes.fetch_sub((size_t)k, std::memory_order_relaxed);
-        server_->statsRef().bytesSent.fetch_add((uint64_t)k, std::memory_order_relaxed);
+        c->wbuf.consume(static_cast<size_t>(k));
+        budget -= static_cast<size_t>(k);
+        c->pendingBytes.fetch_sub(static_cast<size_t>(k), std::memory_order_relaxed);
+        server_->statsRef().bytesSent.fetch_add(static_cast<uint64_t>(k),
+                                                  std::memory_order_relaxed);
     }
     return 0;
 }
@@ -966,12 +991,13 @@ inline int SubReactor::handleRead(Conn* c) noexcept {
             return dispatched();
         }
 
-        size_t want = std::min({sizeof(tmp), c->rbuf.writable(), (size_t)bytesLeft});
+        size_t want = std::min({sizeof(tmp), c->rbuf.writable(), static_cast<size_t>(bytesLeft)});
         ssize_t n = ::recv(c->fd, tmp, want, 0);
         if (n > 0) {
-            c->rbuf.write(tmp, (size_t)n);
-            bytesLeft -= (int)n;
-            server_->statsRef().bytesRecv.fetch_add((uint64_t)n, std::memory_order_relaxed);
+            c->rbuf.write(tmp, static_cast<size_t>(n));
+            bytesLeft -= static_cast<int>(n);
+            server_->statsRef().bytesRecv.fetch_add(static_cast<uint64_t>(n),
+                                                      std::memory_order_relaxed);
         } else if (n == 0) {
             // Peer's FIN. If we still owe it a reply, closing here would turn the
             // last answer into an RST -- the client asked, we processed, and it
@@ -1007,9 +1033,13 @@ inline int SubReactor::handleRead(Conn* c) noexcept {
 inline void SubReactor::handleWrite(Conn* c) noexcept {
     // Past our FIN there is nothing left to write, and the EPOLLOUT bit is kept
     // clear, so an event arriving here is stale: just make sure it is off.
-    if (c->finSent) { disarmWrite(c); return; }
+    if (c->finSent) {
+        disarmWrite(c); return;
+    }
     int r = drainWbufToSocket(c);
-    if (r < 0) { closeConn(c, "send error", false); return; }
+    if (r < 0) {
+        closeConn(c, "send error", false); return;
+    }
     if (!c->wbuf.empty()) return;   // fair-share budget or EAGAIN: EPOLLOUT refires
 
     // wbuf is empty, so anything owed to the peer has reached the kernel: this is
@@ -1056,7 +1086,9 @@ inline void SubReactor::finishPeerClosed(Conn* c) noexcept {
         // Still closing on our side and the peer declared itself done too: the
         // only thing left is the FIN. Anything a handler queued was drained above
         // or is still passing through the socket buffer, ahead of it.
-        if (!tryBeginWriteShutdown(c)) { teardownClosed(c, "peer closed", false); return; }
+        if (!tryBeginWriteShutdown(c)) {
+            teardownClosed(c, "peer closed", false); return;
+        }
     }
     teardownClosed(c, "peer closed", true);
 }
@@ -1065,14 +1097,16 @@ inline void SubReactor::parseFrames(Conn* c, int& framesLeft) noexcept {
     uint8_t hdr[FRAME_HEADER_SIZE];
     while (server_->isRunning() && framesLeft > 0 && c->rbuf.readable() >= FRAME_HEADER_SIZE) {
         c->rbuf.peek(hdr, FRAME_HEADER_SIZE);
-        uint16_t magic = (uint16_t(hdr[0]) << 8) | hdr[1];
+        uint16_t magic = (static_cast<uint16_t>(hdr[0]) << 8) | hdr[1];
         if (magic != FRAME_MAGIC) {
             server_->statsRef().parseErrors.fetch_add(1, std::memory_order_relaxed);
             closeConn(c, "bad magic", false); return;
         }
-        FrameType type = static_cast<FrameType>((uint16_t(hdr[2]) << 8) | hdr[3]);
-        uint32_t len = (uint32_t(hdr[4]) << 24) | (uint32_t(hdr[5]) << 16) |
-                       (uint32_t(hdr[6]) <<  8) |  uint32_t(hdr[7]);
+        FrameType type = static_cast<FrameType>((static_cast<uint16_t>(hdr[2]) << 8) | hdr[3]);
+        uint32_t len = (static_cast<uint32_t>(hdr[4]) << 24)
+                     | (static_cast<uint32_t>(hdr[5]) << 16)
+                     | (static_cast<uint32_t>(hdr[6]) <<  8)
+                     |  static_cast<uint32_t>(hdr[7]);
         if (len > MAX_FRAME_PAYLOAD) {
             server_->statsRef().parseErrors.fetch_add(1, std::memory_order_relaxed);
             closeConn(c, "frame too large", false); return;
@@ -1206,7 +1240,9 @@ inline void SubReactor::discardPendingOutput(Conn* c) noexcept {
 inline void SubReactor::closeConn(Conn* c, const char* reason, bool graceful) noexcept {
     // A graceful close of a live connection is parked; one that has already sent
     // its FIN (or is aborted) is torn down right here.
-    if (graceful && !c->finSent) { parkClose(c, reason); return; }
+    if (graceful && !c->finSent) {
+        parkClose(c, reason); return;
+    }
     teardownClosed(c, reason, graceful);
 }
 
@@ -1229,12 +1265,18 @@ inline void SubReactor::closeConn(Conn* c, const char* reason, bool graceful) no
 // first FIN is still in flight) must not restart the drain or skip it.
 inline void SubReactor::parkClose(Conn* c, const char* reason) noexcept {
     if (c->isClosed.load(std::memory_order_acquire) || c->finSent) return;
-    if (!c->closing) { c->closing = true; c->closeStartedAtMs = nowMs(); }
+    if (!c->closing) {
+        c->closing = true; c->closeStartedAtMs = nowMs();
+    }
     // Hand over what is already queued; whatever does not fit in the socket
     // buffer stays in wbuf and is finished by handleWrite (EPOLLOUT armed).
     int r = drainWbufToSocket(c);
-    if (r < 0) { teardownClosed(c, reason, false); return; }
-    if (!c->wbuf.empty()) { armWrite(c); return; }
+    if (r < 0) {
+        teardownClosed(c, reason, false); return;
+    }
+    if (!c->wbuf.empty()) {
+        armWrite(c); return;
+    }
     // wbuf empty: either every byte is in the socket buffer, or sendmsg stopped
     // exactly on the budget boundary. In both cases nothing more can be queued
     // (`closing` refuses submissions), so the FIN goes out now.
@@ -1313,7 +1355,9 @@ inline void SubReactor::teardownClosed(Conn* c, const char* reason, bool gracefu
     std::shared_ptr<Conn> keepAlive;
     {
         auto it = conns_.find(c->id);
-        if (it != conns_.end()) { keepAlive = it->second; conns_.erase(it); }
+        if (it != conns_.end()) {
+            keepAlive = it->second; conns_.erase(it);
+        }
     }
     unregisterConn(c, graceful);   // fdIndex_ erase + EPOLL_CTL_DEL + close + fd = -1
 
@@ -1430,11 +1474,14 @@ inline void SubReactor::loop() noexcept {
             // when a busy connection immediately schedules itself again.
             for (size_t budget = 0; readHead_ && budget < 64; ++budget) {
                 auto it = conns_.find(readHead_->id);
-                if (it == conns_.end()) { unscheduleRead(readHead_); continue; }
+                if (it == conns_.end()) {
+                    unscheduleRead(readHead_); continue;
+                }
                 auto c = it->second;
                 handleRead(c.get());
             }
-            int n = ::epoll_wait(epollFd_, events.data(), (int)events.size(), readHead_ ? 0 : tickMs);
+            int n = ::epoll_wait(epollFd_, events.data(), static_cast<int>(events.size()),
+                                  readHead_ ? 0 : tickMs);
             if (n < 0) {
                 if (errno == EINTR) continue;
                 server_->statsRef().reactorFailures.fetch_add(1);
@@ -1445,7 +1492,9 @@ inline void SubReactor::loop() noexcept {
                 int      fd = events[i].data.fd;
                 uint32_t ev = events[i].events;
 
-                if (fd == wakeFd_) { drainWakeup(); processPending(); continue; }
+                if (fd == wakeFd_) {
+                    drainWakeup(); processPending(); continue;
+                }
 
                 auto it = fdIndex_.find(fd);
                 if (it == fdIndex_.end()) continue;
@@ -1463,7 +1512,9 @@ inline void SubReactor::loop() noexcept {
                 // (or the peer is gone for good); draining into it cannot work.
                 // Abort so the peer is not left waiting on a stream that will
                 // never complete.
-                if (ev & (EPOLLHUP | EPOLLERR)) { closeConn(c, "hup/err", false); continue; }
+                if (ev & (EPOLLHUP | EPOLLERR)) {
+                    closeConn(c, "hup/err", false); continue;
+                }
                 if (ev & EPOLLIN) {
                     handleRead(c);
                     if (c->isClosed.load(std::memory_order_acquire)) continue;
@@ -1526,8 +1577,12 @@ inline bool MultiReactorServer::initListenSocket() noexcept {
             int zero = 0;
             setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &zero, sizeof(zero));
         }
-        if (::bind(fd, p->ai_addr, p->ai_addrlen) < 0) { ::close(fd); continue; }
-        if (::listen(fd, cfg_.backlog) < 0)             { ::close(fd); continue; }
+        if (::bind(fd, p->ai_addr, p->ai_addrlen) < 0) {
+            ::close(fd); continue;
+        }
+        if (::listen(fd, cfg_.backlog) < 0) {
+            ::close(fd); continue;
+        }
         listenFd_ = fd; break;
     }
     freeaddrinfo(res);
@@ -1563,31 +1618,33 @@ inline bool MultiReactorServer::start() noexcept {
     // before reporting anything.
     struct rlimit rl{};
     if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
-        if ((int)rl.rlim_cur < cfg_.maxConnections + 64 &&
+        if (static_cast<int>(rl.rlim_cur) < cfg_.maxConnections + 64 &&
             rl.rlim_cur < rl.rlim_max) {
             struct rlimit want = rl;
             want.rlim_cur = rl.rlim_max;
             if (setrlimit(RLIMIT_NOFILE, &want) == 0) {
                 std::fprintf(stderr,
-                    "[warn] raised RLIMIT_NOFILE %lu -> %lu for "
+                    "[warn] raised RLIMIT_NOFILE %ju -> %ju for "
                     "maxConnections=%d\n",
-                    (unsigned long)rl.rlim_cur, (unsigned long)rl.rlim_max,
+                    static_cast<uintmax_t>(rl.rlim_cur), static_cast<uintmax_t>(rl.rlim_max),
                     cfg_.maxConnections);
                 rl.rlim_cur = rl.rlim_max;
             }
         }
-        if ((int)rl.rlim_cur < cfg_.maxConnections + 64) {
+        if (static_cast<int>(rl.rlim_cur) < cfg_.maxConnections + 64) {
             std::fprintf(stderr,
-                "[warn] RLIMIT_NOFILE=%lu (hard %lu) too low for "
-                "maxConnections=%d: connections beyond roughly %lu will be "
+                "[warn] RLIMIT_NOFILE=%ju (hard %ju) too low for "
+                "maxConnections=%d: connections beyond roughly %ju will be "
                 "refused, counted as acceptErrors\n",
-                (unsigned long)rl.rlim_cur, (unsigned long)rl.rlim_max,
+                static_cast<uintmax_t>(rl.rlim_cur), static_cast<uintmax_t>(rl.rlim_max),
                 cfg_.maxConnections,
-                (unsigned long)(rl.rlim_cur > 64 ? rl.rlim_cur - 64 : 0));
+                static_cast<uintmax_t>(rl.rlim_cur > 64 ? rl.rlim_cur - 64 : 0));
         }
     }
 
-    if (!initListenSocket()) { life_.store(Life::Stopped, std::memory_order_release); return false; }
+    if (!initListenSocket()) {
+        life_.store(Life::Stopped, std::memory_order_release); return false;
+    }
 
     // ---- Running must be visible before any worker thread is constructed ----
     // Every worker asks isRunning() whether it should keep working, and every
@@ -1614,7 +1671,9 @@ inline bool MultiReactorServer::start() noexcept {
     // why this is not computed here.
     int nReactors = cfg_.resolvedReactorCount();
 
-    try { reactors_.reserve(nReactors); }
+    try {
+        reactors_.reserve(nReactors);
+    }
     catch (...) { ::close(listenFd_); listenFd_ = -1;
                   life_.store(Life::Stopped, std::memory_order_release); return false; }
 
@@ -1658,16 +1717,24 @@ inline bool MultiReactorServer::start() noexcept {
     if (acceptThread_.joinable()) acceptThread_.join();
     for (auto& r : reactors_) r->stop();
     reactors_.clear();
-    if (wakeFd_ >= 0) { ::close(wakeFd_); wakeFd_ = -1; }
-    if (epollFd_ >= 0) { ::close(epollFd_); epollFd_ = -1; }
-    if (listenFd_ >= 0) { ::close(listenFd_); listenFd_ = -1; }
+    if (wakeFd_ >= 0) {
+        ::close(wakeFd_); wakeFd_ = -1;
+    }
+    if (epollFd_ >= 0) {
+        ::close(epollFd_); epollFd_ = -1;
+    }
+    if (listenFd_ >= 0) {
+        ::close(listenFd_); listenFd_ = -1;
+    }
     failed_.store(false, std::memory_order_release);
     life_.store(Life::Stopped, std::memory_order_release);
     return false;
 }
 
 inline void MultiReactorServer::stop() noexcept {
-    if (callbackServer_ == this) { requestStop(); return; }
+    if (callbackServer_ == this) {
+        requestStop(); return;
+    }
     std::lock_guard<std::mutex> lifecycle(lifecycleMutex_);
     // A second stop() (or a stop() after a failed start) must not rerun recovery:
     // it would reopen the submission barrier and join threads that are not there.
@@ -1683,9 +1750,15 @@ inline void MultiReactorServer::stop() noexcept {
     if (acceptThread_.joinable()) acceptThread_.join();
 
     // accept 线程退出后，安全关闭其持有的 fd
-    if (wakeFd_   >= 0) { ::close(wakeFd_);   wakeFd_   = -1; }
-    if (epollFd_  >= 0) { ::close(epollFd_);  epollFd_  = -1; }
-    if (listenFd_ >= 0) { ::close(listenFd_); listenFd_ = -1; }
+    if (wakeFd_   >= 0) {
+        ::close(wakeFd_);   wakeFd_   = -1;
+    }
+    if (epollFd_  >= 0) {
+        ::close(epollFd_);  epollFd_  = -1;
+    }
+    if (listenFd_ >= 0) {
+        ::close(listenFd_); listenFd_ = -1;
+    }
 
     // 停所有 reactor（此时新的 sendTo / closeConnection 已被 isRunning() 拒绝）
     for (auto& r : reactors_) r->stop();
@@ -1741,18 +1814,22 @@ inline void MultiReactorServer::acceptLoop(std::promise<bool>& ready) noexcept {
     }
     }
 
-    try { ready.set_value(ok); } catch (...) {}
+    try {
+        ready.set_value(ok);
+    } catch (...) {}
     // Descriptor setup failure is the accept loop's own failure: raise the shared
     // flag instead of forcing the whole lifecycle down, so start() reports false
     // through its normal recovery path rather than racing on the state.
-    if (!ok) { fail(); return; }
+    if (!ok) {
+        fail(); return;
+    }
 
     std::array<struct epoll_event, 64> events{};
     while (ok && isRunning()) {
 #ifdef INDUSTRIAL_TCP_TESTING
         if (failAcceptForTest.exchange(false)) throw 1;
 #endif
-        int n = ::epoll_wait(epollFd_, events.data(), (int)events.size(), 500);
+        int n = ::epoll_wait(epollFd_, events.data(), static_cast<int>(events.size()), 500);
         if (n < 0) {
             if (errno == EINTR) continue;
             stats_.reactorFailures.fetch_add(1);
@@ -1795,7 +1872,7 @@ inline void MultiReactorServer::acceptLoop(std::promise<bool>& ready) noexcept {
 
                 bool reject = false;
                 {
-                    if (admitted_.load() >= (size_t)cfg_.maxConnections) reject = true;
+                    if (admitted_.load() >= static_cast<size_t>(cfg_.maxConnections)) reject = true;
                 }
                 if (reject) {
                     stats_.rejected.fetch_add(1, std::memory_order_relaxed);
@@ -1830,7 +1907,8 @@ inline void MultiReactorServer::acceptLoop(std::promise<bool>& ready) noexcept {
                 // The reactor bumps it once the socket is registered in both maps,
                 // so a task that fails during registration counts as rejected only.
                 auto admission = std::make_shared<Admission>(admitted_);
-                if (!r->submitNewConnection(std::move(cfdGuard), std::move(peer), id, std::move(admission))) {
+                if (!r->submitNewConnection(std::move(cfdGuard), std::move(peer), id,
+                                          std::move(admission))) {
                     stats_.rejected.fetch_add(1, std::memory_order_relaxed);
                 }
                 } catch (...) {
@@ -1840,18 +1918,25 @@ inline void MultiReactorServer::acceptLoop(std::promise<bool>& ready) noexcept {
             }
         }
     }
-
     } catch (...) {
         stats_.reactorFailures.fetch_add(1);
         fail();
-        try { ready.set_value(false); } catch (...) {}
+        try {
+            ready.set_value(false);
+        } catch (...) {}
     }
     // Close on every exit, including unexpected failure. The same mutex protects
     // stop's wake write, preventing descriptor reuse between its check and write.
     std::lock_guard<std::mutex> descriptors(acceptFdMutex_);
-    if (wakeFd_ >= 0) { ::close(wakeFd_); wakeFd_ = -1; }
-    if (epollFd_ >= 0) { ::close(epollFd_); epollFd_ = -1; }
-    if (listenFd_ >= 0) { ::close(listenFd_); listenFd_ = -1; }
+    if (wakeFd_ >= 0) {
+        ::close(wakeFd_); wakeFd_ = -1;
+    }
+    if (epollFd_ >= 0) {
+        ::close(epollFd_); epollFd_ = -1;
+    }
+    if (listenFd_ >= 0) {
+        ::close(listenFd_); listenFd_ = -1;
+    }
 }
 
 inline bool MultiReactorServer::onConnectionOpened(uint64_t id,
@@ -1944,4 +2029,4 @@ inline std::vector<uint64_t> MultiReactorServer::connectionIds() const {
     return out;
 }
 
-} // namespace industrial
+}  // namespace industrial
