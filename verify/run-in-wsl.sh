@@ -72,7 +72,52 @@ run_all() {
 
 overall=0
 
-# Does an exit code actually survive the trip into Linux?
+# ---- cpplint -------------------------------------------------------------
+# Two things here are traps and both cost real time when missed.
+#
+# 1. cpplint exits 0 whether it found anything or not. Verified: a file holding
+#    `int x = (size_t)y;` reports "Total errors found: 2" and still exits 0. So
+#    the count has to be parsed out of its output; asking for $? is how this
+#    becomes another check that cannot fail.
+# 2. `Total errors found:` is printed only when the number is non-zero -- a clean
+#    file prints nothing beyond "Done processing". Zero and "did not run" look
+#    the same, so every run lints a file that certainly offends first, and the
+#    clean result below is not believed unless that file did offend.
+python3 -m cpplint --version >/dev/null 2>&1 || python3 -m pip install -q cpplint
+
+run_cpplint() {
+    echo "== cpplint =="
+    local out control total
+    printf 'int x = (size_t)y;\n' > .cpplint_control.h
+    control=$(python3 -m cpplint --quiet .cpplint_control.h 2>&1 |
+              sed -n 's/^Total errors found: //p')
+    rm -f .cpplint_control.h
+    case "$control" in
+        ''|*[!0-9]*) echo "  [FAIL] the control run did not produce a finding count"
+                     echo "         (got: '$control'); a clean result below would mean nothing"
+                     return 1 ;;
+    esac
+    if [ "$control" -eq 0 ]; then
+        echo "  [FAIL] cpplint reported 0 findings in a file that certainly has them"
+        return 1
+    fi
+    echo "  control: $control findings, as expected"
+
+    out=$(python3 -m cpplint --quiet tcp-server-mt.h 2>&1)
+    case "$out" in
+        *Traceback*|*"No such file"*|*"command not found"*)
+            echo "  [FAIL] cpplint did not run:"
+            printf '%s\n' "$out" | tail -5
+            return 1 ;;
+    esac
+    total=$(printf '%s\n' "$out" | sed -n 's/^Total errors found: //p')
+    [ -z "$total" ] && total=0     # printed only when the count is non-zero
+    printf '  tcp-server-mt.h: %s findings\n' "$total"
+    [ "$total" -eq 0 ]
+}
+
+run_cpplint || overall=1
+echo
 #
 # Every verdict below reads one. Handing a command to WSL as an inline string
 # (`bash -lc '...'`) reports $? = 0 for `false`, for `(exit 3)` and for a

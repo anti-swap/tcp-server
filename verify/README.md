@@ -131,6 +131,8 @@ g++ -std=c++17 -Wall -Wextra -pthread -DINDUSTRIAL_TCP_TESTING \
 
 ## 七种假阴性（按发现顺序）
 
+> 更新：现在是八种。第 8 条是关于 **cpplint 的退出码** —— 见本节末尾。
+
 前面三形态是**检查器自身**失效；后面几条是**测试自身**在骗人，更隐蔽，因为它们有输出、有绿色。
 
 1. **`cc1plus` 的 DLL 不在 PATH** → 编译器退出码 1 且零诊断，看上去和"干净"一模一样。
@@ -156,6 +158,11 @@ g++ -std=c++17 -Wall -Wextra -pthread -DINDUSTRIAL_TCP_TESTING \
    走**脚本文件**（`bash verify/run-in-wsl.sh`）退出码是完好的，本套件一直走这条路，以往结论不受影响。
    现在这件事本身成了断言：`verify/probe_exit_code.sh` 最先跑，把管道不成立的情况直接判死，
    并说明它问了什么。
+8. **cpplint 无论有没有发现东西都返回 0。** 实测：一个只有 `int x = (size_t)y;` 的文件会打印
+   `Total errors found: 2`，退出码照样是 0。所以结论只能从输出里解析，问 `$?` 等于让这个检查
+   永远通过。更细的一层：`Total errors found:` 这行**只在非零时打印**，文件干净时除
+   `Done processing` 外什么都不输出 —— 于是"干净"和"根本没跑"的输出长得也一样。
+   因此 `run-in-wsl.sh` 每次先 lint 一个必定报错的对照文件，它不报错就不接受后面的"干净"结果。
 
 ## 一处 TSan 误报（此机器上）
 
