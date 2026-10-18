@@ -8,6 +8,12 @@
 #include <cstddef>
 #include <sys/types.h>
 
+// struct timeval comes from the host, not from this shim: mingw-w64 already
+// declares it with the same two long fields Linux uses (<_timeval.h>, guarded),
+// and restating it here is a hard error in any translation unit that also
+// reaches <ctime> -- e.g. through <chrono>, which every test includes.
+#include <_timeval.h>
+
 // mingw's sys/types.h does not define the POSIX socket types.
 typedef unsigned int socklen_t;
 typedef unsigned int u_int32_t;
@@ -60,8 +66,11 @@ int eventfd(unsigned int initval, int flags);
 #define SO_REUSEADDR 2
 #define SO_REUSEPORT 15
 #define SO_KEEPALIVE 9
+#define SO_SNDBUF 7
+#define SO_RCVBUF 8
 #define SO_LINGER 13
 #define SO_RCVTIMEO 20
+#define SO_SNDTIMEO 21
 #define SHUT_RD 0
 #define SHUT_WR 1
 #define SHUT_RDWR 2
@@ -73,6 +82,7 @@ int eventfd(unsigned int initval, int flags);
 #define TCP_KEEPIDLE 4
 #define TCP_KEEPINTVL 5
 #define TCP_KEEPCNT 6
+#define MSG_DONTWAIT 0x40
 #define MSG_NOSIGNAL 0x4000
 #define AI_PASSIVE 0x0001
 #define NI_NUMERICHOST 1
@@ -122,6 +132,25 @@ struct addrinfo {
     struct addrinfo* ai_next;
 };
 
+// ---------- resource limits (<sys/resource.h>) ----------
+// Declared above the extern "C" block on purpose: a struct named only inside
+// that block would introduce a second, unrelated `struct rlimit` there, and the
+// prototypes below would then type-check against a type the header never sees.
+//
+// rlim_t is `unsigned long` on Linux, so the fields keep that type: the point
+// of this shim is to check the header's RLIM_INFINITY comparisons and its
+// uintmax_t widening against the widths the real platform uses.
+struct rlimit { unsigned long rlim_cur; unsigned long rlim_max; };
+
+// 7 is RLIMIT_NOFILE on Linux (x86-64); the value only has to match itself.
+#define RLIMIT_NOFILE 7
+
+// glibc: #define RLIM_INFINITY ((rlim_t)-1). Spelled "all bits set" here rather
+// than -1: the property the header depends on is "the largest rlim_t", not
+// "minus one", and this way the shim does not lean on two's complement in a
+// signed type to express it.
+#define RLIM_INFINITY (~0UL)
+
 extern "C" {
 int socket(int domain, int type, int protocol);
 int connect(int sockfd, const struct sockaddr* addr, socklen_t addrlen);
@@ -129,6 +158,7 @@ int bind(int sockfd, const struct sockaddr* addr, socklen_t addrlen);
 int getsockname(int sockfd, struct sockaddr* addr, socklen_t* addrlen);
 ssize_t send(int sockfd, const void* buf, size_t len, int flags);
 int listen(int sockfd, int backlog);
+int accept(int sockfd, struct sockaddr* addr, socklen_t* addrlen);
 int accept4(int sockfd, struct sockaddr* addr, socklen_t* addrlen, int flags);
 int setsockopt(int sockfd, int level, int optname, const void* optval, socklen_t optlen);
 int getaddrinfo(const char* node, const char* service, const struct addrinfo* hints, struct addrinfo** res);
@@ -142,10 +172,15 @@ int close(int fd);
 ssize_t read(int fd, void* buf, size_t count);
 ssize_t write(int fd, const void* buf, size_t count);
 int getrlimit(int resource, struct rlimit* rlp);
+// const, as on Linux: setrlimit does not modify the struct it is handed.
+int setrlimit(int resource, const struct rlimit* rlp);
 }
 
-#define RLIMIT_NOFILE 7
-struct rlimit { unsigned long rlim_cur; unsigned long rlim_max; };
+// ---------- unistd odds and ends ----------
+typedef unsigned int useconds_t;
+extern "C" {
+int usleep(useconds_t usec);
+}
 
 // unistd aliases the header needs
 using ::read;

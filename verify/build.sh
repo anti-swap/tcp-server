@@ -10,6 +10,14 @@
 # linked. A clean run here means "the header is well-formed C++17"; it does NOT
 # mean "it runs", and it cannot validate runtime behaviour.
 #
+# Every translation unit under verify/ is compiled, not just the trivial
+# checker. Coverage is the whole point: a shim gap in a file nobody type-checks
+# is still a gap, and it decides whether the next one is found now or months
+# later. Compiling two files here while the header had already grown symbols the
+# shim never declared (RLIM_INFINITY, setrlimit, accept, SO_RCVBUF,
+# MSG_DONTWAIT, usleep) is how this script came to be failing on a tree that
+# every Linux-side check called green.
+#
 # Usage:  bash verify/build.sh
 # Exit:   0 = clean, 1 = diagnostics found, 2 = toolchain missing
 
@@ -18,6 +26,13 @@ set -u
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(dirname "$here")"
 
+# This script runs on the Windows side only -- from MSYS/Git Bash, not from WSL.
+# It is deliberately not part of verify/run-in-wsl.sh: the compiler here is a
+# Windows binary, and launching one from Linux leaves it without a Windows
+# environment, so g++ dies with "cannot execute 'cc1plus'" (CreateProcess) rather
+# than compiling anything. Anything that needs this check has to come back to a
+# Windows shell.
+#
 # g++ is a native Windows binary: it cannot resolve MSYS-style /c/... paths.
 to_win() { if command -v cygpath >/dev/null 2>&1; then cygpath -m "$1"; else printf '%s' "$1"; fi; }
 HERE_W="$(to_win "$here")"
@@ -34,26 +49,49 @@ fi
 
 flags=(-std=c++17 -c -Wall -Wextra -Wpedantic -Wshadow -D__linux__ -I "$HERE_W/stub")
 
-echo "== compiling $(basename "$root")/tcp-server-mt.h =="
-if ! "$CXX" "${flags[@]}" "$HERE_W/compile_check.cpp" -o "$HERE_W/compile_check.o" 2>&1; then
-  echo "build.sh: FAILED" >&2
-  rm -f "$here/compile_check.o"
+# One TU. Extra flags are per-file rather than per-script: fault_injection.cpp
+# refuses to compile without the macro that opens the header's test switches,
+# which is the same macro the Linux runner passes it.
+compile_tu() {
+  local rel="$1"
+  local extra=()
+  case "$rel" in
+    *fault_injection*) extra=(-DINDUSTRIAL_TCP_TESTING) ;;
+  esac
+
+  local stem
+  stem="$(basename "$rel" .cpp)"
+  local obj="$here/$stem.o"
+
+  echo "== compiling verify/${rel} =="
+  if ! "$CXX" "${flags[@]}" ${extra[@]+"${extra[@]}"} \
+       "$(to_win "$here/$rel")" -o "$(to_win "$obj")" 2>&1; then
+    echo "build.sh: FAILED on verify/${rel}" >&2
+    rm -f "$obj"
+    return 1
+  fi
+  rm -f "$obj"
+  return 0
+}
+
+tus=()
+for f in "$here"/*.cpp; do
+  [ -e "$f" ] && tus+=("$(basename "$f")")
+done
+# The evidence probes are compiled too, never run here: each one encodes a
+# specific claim about the header, and a header change that breaks one silently
+# -- by making it no longer compile -- is exactly the drift this catches.
+for f in "$here"/evidence/*.cpp; do
+  [ -e "$f" ] && tus+=("evidence/$(basename "$f")")
+done
+
+if [ "${#tus[@]}" -eq 0 ]; then
+  echo "build.sh: no translation units found under $here" >&2
   exit 1
 fi
-rm -f "$here/compile_check.o"
 
-# The runtime test is compiled too (never linked or run here): it includes the
-# header from a second translation unit and exercises APIs the trivial checker
-# does not, so it catches interface drift -- e.g. a renamed public method -- that
-# compile_check.cpp would happily keep compiling.
-if [ -f "$here/close_semantics.cpp" ]; then
-  echo "== compiling $(basename "$root")/verify/close_semantics.cpp =="
-  if ! "$CXX" "${flags[@]}" "$HERE_W/close_semantics.cpp" -o "$HERE_W/close_semantics.o" 2>&1; then
-    echo "build.sh: FAILED" >&2
-    rm -f "$here/close_semantics.o"
-    exit 1
-  fi
-  rm -f "$here/close_semantics.o"
-fi
+for tu in "${tus[@]}"; do
+  compile_tu "$tu" || exit 1
+done
 
-echo "build.sh: OK (no warnings)"
+echo "build.sh: OK (no warnings) -- ${#tus[@]} translation units"

@@ -17,6 +17,13 @@
 # cannot be linked into the same binary, and a run under either is slow enough
 # that folding it into the default pass would stop people running it.
 #
+# Not included here, and it cannot be: verify/build.sh type-checks the header
+# against verify/stub/ with the native Windows toolchain. A Windows binary
+# started from Linux gets no Windows environment, so its g++ fails to launch
+# cc1plus at all. Run it from a Windows shell (bash verify/build.sh) -- it is a
+# different compiler over a different surface, and it has already caught a class
+# of defect this suite cannot see (a POSIX symbol the shim never declared).
+#
 # Idempotent: safe to rerun; the toolchain install is skipped once g++ exists.
 set -euo pipefail
 
@@ -160,6 +167,8 @@ cat <<EOF
     averaged away.
   - A [SKIP] line is a case that asked the machine a question first and did not
     like the answer. It names what it checked. It is not a pass.
+  - This run says nothing about verify/build.sh: that check is Windows-side only
+    and has to be run separately, from a Windows shell.
 
  If a case fails, paste the whole output back -- first without CS_REACTORS, then
  with it.
