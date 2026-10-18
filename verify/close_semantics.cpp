@@ -19,6 +19,15 @@
 //      FIN. And while that answer drains, the reactor must not busy-poll --
 //      level-triggered EPOLLIN on a FIN'd socket returns from every epoll_wait,
 //      so eofReads (FIN wakes) must stay flat during the drain, not run away.
+//   F. Twenty rounds of "close as soon as you know a request arrived". The
+//      window this pokes at is microseconds wide: a request has been read and
+//      handled, but the reply task its handler enqueued has not run yet. A
+//      close landing in it finds nothing further to read, parks immediately,
+//      and every reply task behind it then runs against a connection that is
+//      already `closing` -- which submitSend refuses. Traced once under TSan:
+//      SUBMIT_SEND(answer A) SUBMIT_CLOSE SUBMIT_SEND(answer B) TASK_SEND(A)
+//      PARK_IMMEDIATE TASK_SEND(B) -> REFUSE, 11 of 22 bytes delivered.
+//      One round mostly misses it; twenty mostly do not.
 //
 // Build (Linux only):
 //   g++ -std=c++17 -Wall -Wextra -pthread verify/close_semantics.cpp -o close_semantics
@@ -486,6 +495,71 @@ int main() {
         expect(got.size() == wantBytes,
                "every queued reply survived the peer's half-close");
         dumpStats(server, "E.end");
+    }
+
+    // ---- F: a close racing the reply it is racing ---------------------------
+    //
+    // Case B closes once and hopes. This one asks the same question twenty
+    // times, because the window it is about is microseconds wide and a single
+    // attempt mostly misses it: the two requests have been parsed and their
+    // handler has run, but the reply tasks those handlers enqueued have not
+    // been executed yet. When the close arrives in that window, drainInput
+    // ThenClose finds nothing left to read, parks immediately, and the reply
+    // tasks then run against a connection that is already `closing` -- which
+    // submitSend refuses. From the client this looks like a server that took
+    // the request in, ran the handler, delivered nothing, and hung up politely.
+    {
+        std::printf("F. 20 rounds of close racing the reply\n");
+        dumpStats(server, "F.begin");
+        const auto preexisting = server.connectionIds();
+        const int rounds = 20;
+        // Two requests of three bytes, answered by an echo: exactly these bytes
+        // every round, or an answer was produced and then refused.
+        const size_t wantRound = 2 * (industrial::FRAME_HEADER_SIZE + 3);
+        int lost = 0;
+
+        for (int round = 0; round < rounds; ++round) {
+            int fd = connectTo(port);
+            if (fd < 0) {
+                std::printf("      round %d: connect failed\n", round);
+                ++lost;
+                continue;
+            }
+            sendAll(fd, encode(FrameType::DATA, "one", 3));
+            sendAll(fd, encode(FrameType::DATA, "two", 3));
+            // Close the instant the bytes are known to have arrived, which is
+            // the earliest the application could know there is anything to wait
+            // for -- polling every millimetre rather than every 10ms widens the
+            // window from "almost never" to "most attempts".
+            const uint64_t sentAt = server.stats().bytesRecv.load();
+            for (int i = 0; i < 2000; ++i) {
+                if (server.stats().bytesRecv.load() >=
+                    sentAt + 2 * (industrial::FRAME_HEADER_SIZE + 3)) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            for (uint64_t id : server.connectionIds()) {
+                bool stale = false;
+                for (uint64_t old : preexisting) if (old == id) stale = true;
+                if (!stale) server.closeConnection(id);
+            }
+
+            ReadEnd end = ReadEnd::Invalid;
+            auto got = readToEnd(fd, end, 2000);
+            ::close(fd);
+            // Both requests were served before the close was asked for, so both
+            // answers must arrive: anything less is an answer that existed and
+            // was then refused. Judging a round on "did anything arrive at all"
+            // lets a round that lost one of two replies pass.
+            if (got.size() != wantRound) {
+                ++lost;
+                std::printf("      round %d: %zu of %zu bytes (%s)\n", round,
+                            got.size(), wantRound, readEndName(end));
+            }
+        }
+        std::printf("      %d of %d rounds lost a reply they had produced\n",
+                    lost, rounds);
+        expect(lost == 0, "no round loses an answer it had already produced");
+        dumpStats(server, "F.end");
     }
 
     // ---- D: accounting ------------------------------------------------------
