@@ -128,18 +128,53 @@ CAS **之后**）和 `Conn` 析构兜底，而函数开头已用 acquire 读过 
 加注释说明为什么上面的 `if (c->fd >= 0)` 守卫要留着（将来若出现第二条 detach 路径，
 它才不会变成对 fd -1 的盲调用）。代码未动。
 
-## 6. 附带发现（未在本提交处理）
+## 6. 附带发现：主机侧编译检查自 `9c8200a` 起一直在失败（`0e445f7` 已修）
 
-`verify/build.sh`（Windows 侧编译检查）在 HEAD `9c8200a` 上已经失败：
-`verify/stub` 缺 `RLIM_INFINITY` 与 `setrlimit`，而 `start()` 里的
-`RLIMIT_NOFILE` 提升（`9c8200a` 之前引入）用到了它们。与本条缺陷无关，
-单独提交处理。
+`verify/build.sh`（Windows 侧编译检查）在 HEAD `9c8200a` 上 exit 1：
+
+```
+error: 'RLIM_INFINITY' was not declared in this scope
+error: 'setrlimit' was not declared in this scope
+```
+
+`start()` 会在监听前抬 `RLIMIT_NOFILE`（`9c8200a` 之前引入），而 `verify/stub`
+只声明了 `getrlimit`——`setrlimit` 和 `RLIM_INFINITY` 都没有。它是这次唯一
+一条**别人已经说对、我却一直没看见**的问题：Linux 侧每轮全绿，而这个脚本
+不在 `run-in-wsl.sh` 里，也没人单独跑它。
+
+补齐 shim 之后又冒出四处缺口，全都在脚本**从未编译过**的文件里：`accept`、
+`SO_RCVBUF`、`MSG_DONTWAIT`、`usleep` / `struct timeval`。所以真正的缺陷不是
+某个符号，而是覆盖面——它只编译 2 个 TU。现在它编译 `verify/` 下全部 `.cpp`
+（含 evidence 探针），共 10 个 TU；下一个缺口会在它被需要的当天暴露，而不是
+等哪天有人手跑一次。
+
+两处值得一提的细节：
+
+- `struct timeval` 取自宿主的 `<_timeval.h>`，不在 shim 里重写。mingw-w64 已经
+  声明过（字段与 Linux 同形），任何经 `<chrono>` 触到 `<ctime>` 的 TU 也都会
+  拿到它——再定义一份是硬错误（实测撞过）。
+- `struct rlimit` 移到 `extern "C"` 块**之前**。只在块内被提名的话，那两个
+  原型检查的是一个头文件永远看不到的类型。
+
+**它没能接进 `run-in-wsl.sh`，这点如实记录**：WSL 里能执行那个 Windows 的
+`g++.exe`，但 Windows 进程从 Linux 启动时拿不到 Windows 环境，`cc1plus` 起不来
+（`CreateProcess: No such file or directory`）；补 `SYSTEMROOT` 与 Windows 形态
+的 `PATH` 仍无效，经 `cmd.exe` 包装又被环境的安全策略拦下。所以它是 Windows 侧
+单独一步，`run-in-wsl.sh` 现在明确写出"本轮对它一无所知"，而不是让人以为覆盖到了。
+
+**对照实验（证明该检查会失败）**：删掉 `setrlimit` 声明 → `build.sh` exit 1；
+恢复 → exit 0。另加 `verify/evidence/check_build_exit.sh`：独立运行 `build.sh`
+并用它的退出码再退出，避免被管道吞掉。
 
 ## 7. 回归
 
-两次（P1-1c 之后、N1+N2/N3 之后）各跑一遍 `ENABLE_ASAN=1 ENABLE_TSAN=1 bash verify/run-in-wsl.sh`：
+三次（P1-1c 之后、N1+N2/N3 之后、build 修复之后）各跑一遍
+`ENABLE_ASAN=1 ENABLE_TSAN=1 bash verify/run-in-wsl.sh`：
 
 - plain / asan+ubsan / tsan × { close_semantics(默认, CS_REACTORS=1), backpressure,
   fault_injection } = 12 种配置，`rc=0`
 - cpplint：对照文件 2 findings（证明该检查可失败），`tcp-server-mt.h` 0 findings
 - 退出码哨兵 9 项全 OK
+
+主机侧另跑 `bash verify/build.sh`（Windows shell，不在 WSL 回归内）：10 个 TU、
+无警告、exit 0。
