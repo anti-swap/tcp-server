@@ -1,56 +1,66 @@
-# 审查记录
+# Review record
 
-对一个单头文件（`include/tcp-server-mt.h`）做的八轮代码审查。按发生顺序排列。
+Eight rounds of code review against one header, `include/tcp-server-mt.h`, in
+the order they happened.
 
-这些报告写于 2026-10-17 至 2026-10-18，文件名是当时逐个起的，于是留下三种
-风格：第一轮没有日期（`CODE-REVIEW.md`），第二轮有日期但没有编号
-（`CODE-REVIEW-2026-10-18.md`），从第三轮起才有了 `roundN`。**没有统一改名**，
-因为正文之间存在互相引用，而且它们本质上是历史快照——见下面三条注意事项。
-用这张索引表消化命名的混乱，比重写八份历史更划算。
+The files were named one at a time as they were written on 2026-10-17 and
+2026-10-18, which left three conventions behind: the first round carries no date
+(`CODE-REVIEW.md`), the second carries a date but no number
+(`CODE-REVIEW-2026-10-18.md`), and the number only appears from the third round
+on. **The names were never unified** -- they cite each other, and each is a
+snapshot of what was true when it was written; see the three cautions below. An
+index table absorbs the mess more cheaply than rewriting eight historical
+documents.
 
-## 目录
+## Contents
 
-| # | 文件 | 时间 | 性质 | 主要条目 |
+| # | File | Date | Kind | Main entries |
 |---|---|---|---|---|
-| 1 | [CODE-REVIEW.md](CODE-REVIEW.md) | 2026-10-17 | 首轮完整静态审查 | 清单 P0-1 ~ P2-6；后续逐条修复并在 Linux 上验证 |
-| 2 | [CODE-REVIEW-2026-10-18.md](CODE-REVIEW-2026-10-18.md) | 2026-10-18 | 复审（full） | 确认第一轮全部已修，重新扫描只报仍存在或新发现的问题 |
-| 3 | [CODE-REVIEW-2026-10-18-round3.md](CODE-REVIEW-2026-10-18-round3.md) | 2026-10-18 | 复审（full） | P1：`framesSent` 把从未发出的帧永久计为"已发送"；另有一条本轮主动撤回的推断 |
-| 4 | [CODE-REVIEW-2026-10-18-round4.md](CODE-REVIEW-2026-10-18-round4.md) | 2026-10-18 | 外部截图核实一条 | `finishPeerClosed()` 的"停靠"分支在 `epoll_ctl(MOD)` 失败后是否 busy loop |
-| 5 | [CODE-REVIEW-2026-10-18-round5.md](CODE-REVIEW-2026-10-18-round5.md) | 2026-10-18 | 复审（full） | R5-1 ~ R5-7：P1 是 PING/PONG 与 idle 语义零覆盖；两条 P2 是空闲判定只看完整帧、`teardownClosed()` 在 `noexcept` 里做可能抛出的 `push_back` |
-| 6 | [CODE-REVIEW-2026-10-18-round6.md](CODE-REVIEW-2026-10-18-round6.md) | 2026-10-18 | 复审（full） | R6-1 ~ R6-7：P1 是在关闭回调里丢弃最后一个 owner 导致必定 abort；另有三条记账口径问题 |
-| 7 | [CODE-REVIEW-2026-10-18-round7.md](CODE-REVIEW-2026-10-18-round7.md) | 2026-10-18 | 外部截图核实一条 | `close` 与对端 FIN 落在同一次 `handleRead` 时，刚排队的应答被提前的 FIN 吞掉 |
-| 8 | [CODE-REVIEW-2026-10-18-round8.md](CODE-REVIEW-2026-10-18-round8.md) | 2026-10-18 | 外部清单四条核实 | 关闭预算按帧而非字节计费、`stateHandler` 抛异常时一个连接同时计入 `accepted` 与 `rejected`、`handleWrite` 抢在 `processPending` 之前、`unregisterConn` 清 `closing` 与 `cleanup` 未回滚 |
+| 1 | [CODE-REVIEW.md](CODE-REVIEW.md) | 2026-10-17 | full static review | The first pass; defects P0-1 to P2-6, each later fixed and verified on Linux |
+| 2 | [CODE-REVIEW-2026-10-18.md](CODE-REVIEW-2026-10-18.md) | 2026-10-18 | full re-review | Confirmed every round-1 item fixed, then rescanned to report only what survived or was new |
+| 3 | [CODE-REVIEW-2026-10-18-round3.md](CODE-REVIEW-2026-10-18-round3.md) | 2026-10-18 | full re-review | P1: `framesSent` counted frames that were never sent as sent, permanently. Also contains an inference this round retracted on purpose |
+| 4 | [CODE-REVIEW-2026-10-18-round4.md](CODE-REVIEW-2026-10-18-round4.md) | 2026-10-18 | one item from outside | Whether `finishPeerClosed()`'s park branch busy-loops after a failed `epoll_ctl(MOD)` |
+| 5 | [CODE-REVIEW-2026-10-18-round5.md](CODE-REVIEW-2026-10-18-round5.md) | 2026-10-18 | full re-review | R5-1 to R5-7. P1: zero coverage of PING/PONG and idle semantics. Two P2s: idleness measured only in whole frames, and `teardownClosed()` doing four throwing `push_back`s inside `noexcept` |
+| 6 | [CODE-REVIEW-2026-10-18-round6.md](CODE-REVIEW-2026-10-18-round6.md) | 2026-10-18 | full re-review | R6-1 to R6-7. P1: dropping the last owner inside a close callback makes the process abort, always. Three more about what gets counted how |
+| 7 | [CODE-REVIEW-2026-10-18-round7.md](CODE-REVIEW-2026-10-18-round7.md) | 2026-10-18 | one item from outside | When `close` and the peer's FIN land in one `handleRead`, the reply just queued is swallowed by an early FIN |
+| 8 | [CODE-REVIEW-2026-10-18-round8.md](CODE-REVIEW-2026-10-18-round8.md) | 2026-10-18 | four items from outside | The close budget denominated in frames rather than bytes; one connection counted in both `accepted` and `rejected` when `stateHandler` throws; `handleWrite` beating `processPending`; `unregisterConn` clearing `closing` while `cleanup` never rolled back |
 
-第四轮、第七轮、第八轮都属于"别人提出问题，这边核实"——不是完整复审，篇幅
-也短得多。想看 full 模式的完整产出，看第一、二、三、五、六轮。
+Rounds 4, 7 and 8 are all "someone raised it, this side checked it" -- not full
+reviews, and much shorter accordingly. For what a full pass produces, read rounds
+1, 2, 3, 5 and 6.
 
-## 读这些报告之前，有三件事要知道
+## Three things to know before reading them
 
-**一、路径已经变了。** 所有报告都把头文件写成 `tcp-server-mt.h`，因为它们写于
-2026-10-18 那次目录整理之前——当时它确实在仓库根目录。现在它在
-`include/tcp-server-mt.h`。
+**One, the path has moved.** Every report calls the header `tcp-server-mt.h`,
+because they were written before the directory move on 2026-10-18, when it
+really was at the repository root. It is now `include/tcp-server-mt.h`.
 
-**二、行号已经漂了。** 报告里的 `tcp-server-mt.h:880` 这类引用只对当时的基线
-成立。头文件从最初的 2032 行长到现在 2937 行，中途还做过一次 80 列重排和中文
-注释英文化，两者都大幅移动了行。每份报告开头的"审查基线"才是它行号对应的那棵
-树。
+**Two, the line numbers have drifted.** A reference like `tcp-server-mt.h:880`
+holds only against the baseline it was written from. The header grew from 2032
+lines to its present 2937, and a reflow to 80 columns plus translating the
+comments into English moved most lines in between. The baseline named at the top
+of each report is the tree its line numbers refer to.
 
-**三、报告里引用的提交哈希大部分已经失效。** 2026-10-18 把整个历史重放到远端
-那个 `Initial commit` 之上（为了和 GitHub 网页生成的 LICENSE 合并），于是 97 笔
-提交的哈希全部改写。旧哈希目前还能解析，是因为对象还在本地 `.git` 里被 reflog
-吊着；一次 `git gc` 之后就彻底失效。逐份去改正文里的旧哈希不值得，所以这里给对
-照表，已用 tree 比对确认两边内容一致（唯一差异是 `Initial commit` 带来的
-`.gitignore` / `LICENSE` / `README.md`）：
+**Three, most of the commit hashes quoted inside them no longer resolve.** On
+2026-10-18 the whole history was replayed onto the remote `Initial commit`, to
+land on top of the LICENSE GitHub generated in the web UI, and all 97 commits
+were rewritten. The old hashes resolve today only because the objects are still
+held in this clone's `.git` by its reflog; one `git gc` and they are gone. Editing
+them out of eight documents was not worth it, so here is the table instead. Each
+pair was checked tree against tree -- the only difference is the
+`.gitignore` / `LICENSE` / `README.md` that `Initial commit` brought:
 
-| 报告里的旧哈希 | 现在的哈希 | 当时的头文件行数 |
+| Hash in the reports | Hash now | Header lines at the time |
 |---|---|---|
 | `28a1615` | `d299e07` | 2032 |
 | `0c9d363` | `0913c11` | 2152 |
 | `7454530` | `39f74b3` | 2358 |
 | `93e1673` | `e61c1c3` | 2436 |
 
-## 这些审查共同遵守的规矩
+## The rule every round followed
 
-没有运行时证据的不写成缺陷。每一条都要先写一个探针让它真的出错（红），再改，
-再跑同一个探针确认变绿，最后把"缺陷的修复"和"证明它的东西"分成两次提交。这个
-规矩从第一轮到第八轮没有变过，也是这些报告里最值得看的部分——比结论本身更值得。
+Nothing was written down as a defect without runtime evidence. Each one had a
+probe written first to make it actually fail, then a fix, then the same probe run
+again to watch it go green -- and the fix and the proof went in as two separate
+commits. That held from round 1 to round 8, and it is the part of these reports
+worth reading more than the conclusions themselves.
