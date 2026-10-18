@@ -655,6 +655,19 @@ class MultiReactorServer {
         if (life_.compare_exchange_strong(expected, Life::Stopping,
                                           std::memory_order_acq_rel)) {
             wakeAcceptLoop();
+            // The reactors are not woken here, so one of them may sit in
+            // epoll_wait for up to tickMs before it sees the state and leaves.
+            // Waking them means touching reactors_ from here, and this runs on
+            // three different threads: a caller's, the accept loop's, and a
+            // callback's (SubReactor::stop() routes a stop from inside a callback
+            // through here). reactors_ is only mutated by stop(), under
+            // lifecycleMutex_ -- which cannot be taken here, because that same
+            // callback path already holds it. So the choice is a lock that
+            // deadlocks or a read that races a clear().
+            //
+            // Left as it is on purpose: stop() wakes every reactor itself and
+            // joins them, so only the requestStop() + wait() pairing sees this,
+            // and wait() polls at 200ms -- coarser than the tickMs it would save.
         }
     }
     void wakeAcceptLoop() noexcept;
@@ -934,8 +947,24 @@ inline bool SubReactor::submitSend(uint64_t id,
             }
 
             // 全帧原子写入：容量不足则整帧丢弃（不破坏帧流）
+            //
+            // Reachable in principle, not in any configuration this file accepts:
+            // start() clamps maxPendingBytes down to wbufCapacity, a frame's
+            // reservation stays in pendingBytes until it is written, and wbuf's
+            // contents are a subset of what pendingBytes covers -- so
+            // wbuf.writable() >= f.size() holds here by construction. Measured
+            // under 8 concurrent producers, 38MB actually sent, to the point of
+            // 35369 refusals elsewhere: this branch fired 0 times.
+            //
+            // Kept rather than asserted away, because the alternative to refusing
+            // is a partial frame in wbuf, which corrupts the stream. It records
+            // both counters now, as the close branch above does: a refusal is one
+            // event that operations may want to read either way, and recording
+            // whichever one this branch reached is what made them incomparable.
             if (c->wbuf.writable() < f.size()) {
                 c->pendingBytes.fetch_sub(f.size(), std::memory_order_relaxed);
+                server_->statsRef().bytesDropped.fetch_add(f.size(),
+                                                           std::memory_order_relaxed);
                 server_->statsRef().queueDrops.fetch_add(1, std::memory_order_relaxed);
                 return;
             }
@@ -1149,23 +1178,29 @@ inline int SubReactor::handleRead(Conn* c) noexcept {
             // go out once wbuf drains.
             server_->statsRef().eofReads.fetch_add(1, std::memory_order_relaxed);
             c->peerClosed = true;
-            parseFrames(c, framesLeft);
-            if (c->isClosed.load(std::memory_order_acquire)) return dispatched();
-            // No "budget spent, frames still buffered" case can exist here.
-            // Every path that reaches recv() has already established that fewer
-            // complete frames are buffered than the budget allows: parseFrames
-            // at the top of the loop would otherwise have driven framesLeft to
-            // 0 and exited before the read. recv() returning 0 adds no bytes,
-            // so the parse above consumed nothing and framesLeft still holds.
-            // (Measured: eofReads stays at 1 across bursts of 1..2000 frames,
-            // which is what makes it usable as the busy-poll probe of P1-1b.)
+            // No re-parse here, and none is missing. Two things hold at this
+            // point: parseFrames() at the top of the loop has just consumed
+            // everything rbuf could yield (otherwise framesLeft would have hit 0
+            // and the loop would have rescheduled and returned before the read),
+            // and recv() returning 0 adds no bytes. So rbuf is byte-for-byte what
+            // the parse above already saw, and parsing it again can only find
+            // nothing -- which is why the old call here looked like a second
+            // chance and was not one.
+            //
+            // No "budget spent, frames still buffered" case can exist here, for
+            // the same reason. (Measured: eofReads stays at 1 across bursts of
+            // 1..2000 frames, which is what makes it usable as the busy-poll
+            // probe of P1-1b.)
             assert(framesLeft > 0);
             finishPeerClosed(c);
             return dispatched();
         } else {
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                parseFrames(c, framesLeft);  // 再解析一次
+                // Same reasoning as the n == 0 branch: recv() added nothing, so
+                // there is nothing new to parse. The parse that used to sit here
+                // could not have found a frame the one at the top of the loop had
+                // not already taken.
                 return dispatched();
             }
             closeConn(c, "recv error", false); return dispatched();
@@ -1369,11 +1404,15 @@ inline void SubReactor::parseFrames(Conn* c, int& framesLeft) noexcept {
                     break;
                 }
             }
-            if (!reserved || c->wbuf.writable() < pong.size()) {
-                if (reserved) c->pendingBytes.fetch_sub(pong.size(),
-                                                        std::memory_order_relaxed);
-                // 全帧规则同样适用：PONG 发不出去 → 对端长期不读，断开
-                // 强制断开：对端已经没有接收能力，再排空只是拖长描述符占用。
+            // 全帧规则同样适用：PONG 发不出去 → 强制断开（对端已无接收能力）。
+            // 两种原因分开报：它们的补救方向不同，而 wbuf 那一半按上面的不变式
+            // 不可达——真正会发生的只有 pendingBytes 撞上 maxPendingBytes，把它
+            // 报成 "wbuf full" 会把关闭回调的读者指向错误的方向。
+            if (!reserved) {
+                closeConn(c, "pending bytes at limit on pong", false); return;
+            }
+            if (c->wbuf.writable() < pong.size()) {
+                c->pendingBytes.fetch_sub(pong.size(), std::memory_order_relaxed);
                 closeConn(c, "wbuf full on pong", false); return;
             }
             if (c->closing) {
