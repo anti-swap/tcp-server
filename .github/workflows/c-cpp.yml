@@ -1,8 +1,10 @@
 # What this job can claim, and what it cannot.
 #
-# verify/run-in-wsl.sh is the real gate: seven suites compiled and run under
-# plain, asan+ubsan and tsan, plus cpplint on the header. All of it is Linux
-# work, so an ubuntu-latest runner covers the interesting half of the project.
+# verify/run-in-wsl.sh is the real gate: the suite compiled and run under plain,
+# asan+ubsan and tsan, plus cpplint on the header. All of it is Linux work, so an
+# ubuntu-latest runner covers the interesting half of the project. The counts are
+# left out on purpose -- reactor_spread alone doubled one of them, and a number
+# in a comment is a number that goes stale without anything failing.
 #
 # verify/build.sh is deliberately absent. It type-checks the header against a
 # hand-written POSIX shim on Windows -- that check exists because this desk
@@ -27,8 +29,8 @@ on:
 jobs:
   linux:
     runs-on: ubuntu-latest
-    # 21 runs of 7 suites. Each one has a 180s timeout inside the script, so a
-    # hung case presents as a failure rather than as an idle job.
+    # Every run has a 180s timeout inside the script, so a hung case presents as
+    # a failure rather than as an idle job.
     timeout-minutes: 60
 
     steps:
@@ -52,7 +54,7 @@ jobs:
             python3 -m pip install -q cpplint
           python3 -m cpplint --version
 
-      - name: seven suites under plain, asan+ubsan and tsan
+      - name: the suite under plain, asan+ubsan and tsan
         env:
           ENABLE_ASAN: "1"
           ENABLE_TSAN: "1"

@@ -35,8 +35,9 @@ This project has no "just run it and see" position. Two checks cover two halves:
 # nothing linked, nothing executed.
 bash verify/build.sh
 
-# Linux/WSL side: actually run it. 7 suites x {plain, asan+ubsan, tsan} = 21
-# configurations, cpplint included.
+# Linux/WSL side: actually run it. Seven suites, nine runs per configuration --
+# two of them run twice, at different reactor counts -- over {plain, asan+ubsan,
+# tsan}: 27 configurations, cpplint included.
 wsl env ENABLE_ASAN=1 ENABLE_TSAN=1 bash verify/run-in-wsl.sh
 ```
 
@@ -72,7 +73,7 @@ either layout -- before or after the directory move on 2026-10-18.
 
 Three rounds (the sixth, the seventh and the eighth) each closed carrying the
 same few items they could not settle themselves. They were never disproved; they
-were only never executed locally. The first of them now has been:
+were only never executed locally. Two of the three have since been closed:
 
 - **`EPOLLHUP` / `EPOLLERR` -- closed, 2026-10-18, on a real kernel.** This case
   printed `[SKIP]` on every machine here, because those kernels hand an aborted
@@ -85,12 +86,23 @@ were only never executed locally. The first of them now has been:
   because a `[SKIP]` leaves the exit code alone: nothing else in the output
   separates "asserted and passed" from "never ran".
 
-Two remain open:
+- **Which reactor a connection lands on -- closed, 2026-10-18.** The note here
+  used to say that reactor-count-dependent behaviour had only been run with
+  `numReactors = 1`, which was no longer true and had not been for some rounds:
+  `close_semantics` has defaulted to two since the seventh, and the runner also
+  takes it down to one on purpose, because with a single worker a fault that
+  belongs to one worker is averaged away and reads as a pass. What was really
+  unasserted was narrower and worse -- nothing observed `pickReactor()`'s
+  round-robin, so returning the first reactor every time left all 21
+  configurations green. `verify/reactor_spread.cpp` asks it directly: eight
+  connections over four reactors have to be handled by four distinct threads. It
+  runs at four reactors and again at two, so the assertion is shown to follow the
+  configuration rather than a constant, and both existing two-reactor suites were
+  run against a deliberately broken `pickReactor()` first to confirm they could
+  not have caught it.
 
-- **Measured behaviour with several reactors**: the conclusions that depend on
-  reactor count were only ever run with `numReactors = 1`. More reactors does not
-  change the control flow of those functions -- they run only on the owning
-  thread -- but that has not been measured.
+One remains open:
+
 - **One count folded into another**: a certain class of residual drops now lands
   in `queueDrops` / `bytesDropped`, counted the same as a genuine close branch.
   Under the current contract that is the same event; separating them would take a
