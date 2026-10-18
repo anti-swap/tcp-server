@@ -478,6 +478,8 @@ class SubReactor {
     // establishes that before calling in; it is not checked here.
     void finishPeerClosed(Conn* c) noexcept;
     void unregisterConn(Conn* c, bool graceful = true) noexcept;
+    // The rest of a rollback for a connection that never took its place here.
+    void discardRejectedConn(Conn* c) noexcept;
     void discardPendingOutput(Conn* c) noexcept;
     void finishClose(std::shared_ptr<Conn>& c) noexcept;
     void flushCloseCallbacks() noexcept;
@@ -939,13 +941,15 @@ inline bool SubReactor::submitNewConnection(
                 } catch (...) {
                     // Roll back through the same path every other failure uses, so
                     // the epoll registration does not outlive the map entry and get
-                    // silently re-attributed when the fd number is recycled.
-                    unregisterConn(c.get());
+                    // silently re-attributed when the fd number is recycled --
+                    // and so the map entry does not outlive the descriptor either:
+                    // unregisterConn() alone left a ghost behind.
+                    discardRejectedConn(c.get());
                     server_->statsRef().rejected.fetch_add(1, std::memory_order_relaxed);
                     return;
                 }
                 if (!server_->onConnectionOpened(id, c)) {
-                    unregisterConn(c.get());
+                    discardRejectedConn(c.get());
                     server_->statsRef().rejected.fetch_add(1, std::memory_order_relaxed);
                     return;
                 }
@@ -962,8 +966,12 @@ inline bool SubReactor::submitNewConnection(
                 }
             };   // NOTE: accepted is bumped inside, not by the accept loop
     } catch (...) {
-        // Local guards retain ownership if constructing the task fails.
-        server_->statsRef().queueDrops.fetch_add(1, std::memory_order_relaxed);
+        // Local guards retain ownership if constructing the task fails. No
+        // counter of our own: nothing was ever offered to a queue, so
+        // queueDrops -- "a frame was refused at enqueue" -- would be a lie
+        // about an event that has no frame in it, and the false return below is
+        // what the accept loop counts as rejected. Incrementing here too is how
+        // one turned-away connection came to read as two.
         return false;
     }
 
@@ -1487,6 +1495,14 @@ inline void SubReactor::parseFrames(Conn* c, int& framesLeft) noexcept {
             c->rbuf.consume(len);
         } else {
             if (len > 0) {
+                // Unreachable, and kept: the alternative to having this branch
+                // is an out-of-bounds read, and "it cannot happen" is a claim
+                // about today's invariants, not about the next edit. The
+                // invariant is that frameScratch_ is resized to
+                // MAX_FRAME_PAYLOAD in start() -- which fails outright if that
+                // allocation fails -- and len was clamped to MAX_FRAME_PAYLOAD
+                // above, so len <= frameScratch_.size() always holds. It reads
+                // like a defence that fires. It does not.
                 if (len > frameScratch_.size()) {
                     closeConn(c, "scratch too small", false); return;
                 }
@@ -1525,6 +1541,30 @@ inline void SubReactor::unregisterConn(Conn* c, bool graceful) noexcept {
     c->fd = -1;
     c->writeArmed = false;
     c->closing.store(false, std::memory_order_release);
+}
+
+// A connection that was accepted and then refused by its own registration --
+// the map insert threw, or onConnectionOpened said no. unregisterConn() already
+// took the descriptor, the epoll registration and the fdIndex_ entry, and used
+// to be the whole of the rollback: the conns_ entry survived it as a Conn with
+// fd == -1, not closed and not closing. doTick then read it as idle and parked
+// a graceful close whose tryBeginWriteShutdown() cannot even start (fd < 0), so
+// it died only when the linger expired -- idleTimeoutMs + closeLingerMs after
+// it was already dead -- holding a map entry and an admission slot meanwhile.
+//
+// Not teardownClosed(): that counts closed (and aborted), and this connection
+// was never accepted, so counting it here would put accepted and closed out of
+// step for good. It is the same single-exit reasoning, though -- one function,
+// so the two rollback paths cannot drift apart the way they did.
+inline void SubReactor::discardRejectedConn(Conn* c) noexcept {
+    unregisterConn(c);
+    conns_.erase(c->id);
+    server_->onConnectionClosed(c->id);
+    c->isClosed.store(true, std::memory_order_release);
+    // The task holds the last reference and would release the ticket on return
+    // either way; releasing it here instead frees the admission slot now rather
+    // than whenever the ghost was going to be reaped.
+    c->admission.reset();
 }
 
 // pendingBytes is reserved at enqueue time and released on two paths only:
@@ -2412,7 +2452,10 @@ inline bool MultiReactorServer::onConnectionOpened(uint64_t id,
         conns_[id] = std::move(c);
         return true;
     } catch (...) {
-        stats_.queueDrops.fetch_add(1, std::memory_order_relaxed);
+        // No counter here either. queueDrops is "a frame was refused at
+        // enqueue", and there is no frame in this failure -- the false return
+        // is what the reactor counts as rejected, which is the one question
+        // this answer can support.
         return false;
     }
 }
