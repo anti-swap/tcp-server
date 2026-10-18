@@ -101,6 +101,17 @@ struct sockaddr_in {
     struct in_addr sin_addr;
     char           sin_zero[8];
 };
+// Matched on layout, not on spelling: a listener bound to :: resolves its port
+// through this struct, so a shim without it leaves getsockname unusable for the
+// one address family the header binds when it is asked to bind any.
+struct in6_addr { unsigned char s6_addr[16]; };
+struct sockaddr_in6 {
+    unsigned short  sin6_family;
+    unsigned short  sin6_port;
+    unsigned int    sin6_flowinfo;
+    struct in6_addr sin6_addr;
+    unsigned int    sin6_scope_id;
+};
 unsigned short htons(unsigned short v);
 unsigned short ntohs(unsigned short v);
 unsigned int   htonl(unsigned int v);

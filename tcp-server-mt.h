@@ -552,6 +552,9 @@ class MultiReactorServer {
 
     struct Config {
         std::string bindAddr        = "0.0.0.0";
+        // 0 means "kernel, pick one" -- and then port() is the only way to
+        // learn what was picked, so start() succeeding says nothing about
+        // whether anyone can reach the server until port() is read.
         uint16_t    port            = 0;
         // Must be > 0 (start() refuses otherwise): Linux clamps listen()'s
         // backlog only from above, so 0 would pass straight through as a
@@ -644,6 +647,13 @@ class MultiReactorServer {
     size_t connectionCount() const noexcept;
     std::vector<uint64_t> connectionIds() const;
 
+    // Where the listening socket actually is. Equals Config::port unless that
+    // was 0, in which case this is the ephemeral port the kernel chose -- the
+    // only place that number exists after bind(). 0 before start() has bound
+    // and after stop() has closed: no socket, no port, and a stopped server
+    // must not keep reporting one. Read it after start(), not before.
+    uint16_t port() const noexcept;
+
     const ServerStats& stats() const noexcept { return stats_; }
 
     // SubReactor 内部接口
@@ -699,6 +709,10 @@ class MultiReactorServer {
     void wakeAcceptLoop() noexcept;
 
     bool        initListenSocket() noexcept;
+    // The one place the listening socket is closed, so that "no socket" and "no
+    // port" cannot drift apart: a port() that outlives its socket reads like a
+    // server that is still there.
+    void        closeListenSocket() noexcept;
     void        acceptLoop(std::promise<bool>& ready) noexcept;
     SubReactor* pickReactor() noexcept;
 
@@ -706,6 +720,11 @@ class MultiReactorServer {
     int listenFd_ = -1;
     int epollFd_  = -1;
     int wakeFd_   = -1;
+    // Resolved from the bound socket, never from cfg_. The obvious alternative
+    // -- writing it back into cfg_.port after bind() -- makes the next start()
+    // after a stop() bind last run's throwaway number instead of asking for a
+    // fresh one, which is a worse surprise than the one being fixed.
+    std::atomic<uint16_t> boundPort_{0};
 
     std::atomic<Life>     life_{Life::Stopped};
     std::atomic<bool>     failed_{false};
@@ -1982,10 +2001,39 @@ inline bool MultiReactorServer::initListenSocket() noexcept {
         if (::listen(fd, cfg_.backlog) < 0) {
             ::close(fd); continue;
         }
-        listenFd_ = fd; break;
+        listenFd_ = fd;
+        // Config::port == 0 asks the kernel to choose, and the number it chose
+        // lives nowhere except on the socket. Without reading it back, a
+        // default-Config server starts, returns true, and is unreachable by any
+        // client that did not already know the port -- and stats() cannot say
+        // so either, because accepted stays 0 for exactly the same reason.
+        struct sockaddr_storage bound{};
+        socklen_t boundLen = sizeof(bound);
+        uint16_t resolved = 0;
+        if (::getsockname(fd, reinterpret_cast<struct sockaddr*>(&bound),
+                          &boundLen) == 0) {
+            if (bound.ss_family == AF_INET) {
+                resolved = ntohs(reinterpret_cast<struct sockaddr_in*>(&bound)->sin_port);
+            } else if (bound.ss_family == AF_INET6) {
+                resolved = ntohs(reinterpret_cast<struct sockaddr_in6*>(&bound)->sin6_port);
+            }
+        }
+        // getsockname failing on a descriptor that just bound is not a state
+        // worth a third meaning for; port() then reports what was asked for,
+        // which is wrong only in the case that cannot happen.
+        boundPort_.store(resolved != 0 ? resolved : cfg_.port,
+                         std::memory_order_release);
+        break;
     }
     freeaddrinfo(res);
     return listenFd_ >= 0;
+}
+
+inline void MultiReactorServer::closeListenSocket() noexcept {
+    if (listenFd_ >= 0) {
+        ::close(listenFd_); listenFd_ = -1;
+    }
+    boundPort_.store(0, std::memory_order_release);
 }
 
 inline bool MultiReactorServer::start() noexcept {
@@ -2091,7 +2139,7 @@ inline bool MultiReactorServer::start() noexcept {
     try {
         reactors_.reserve(nReactors);
     }
-    catch (...) { ::close(listenFd_); listenFd_ = -1;
+    catch (...) { closeListenSocket();
                   life_.store(Life::Stopped, std::memory_order_release); return false; }
 
     try {
@@ -2100,7 +2148,7 @@ inline bool MultiReactorServer::start() noexcept {
         if (!r->start()) {
             for (auto& rr : reactors_) rr->stop();
             reactors_.clear();
-            ::close(listenFd_); listenFd_ = -1;
+            closeListenSocket();
             life_.store(Life::Stopped, std::memory_order_release); return false;
         }
         reactors_.push_back(std::move(r));
@@ -2108,7 +2156,7 @@ inline bool MultiReactorServer::start() noexcept {
     } catch (...) {
         for (auto& r : reactors_) r->stop();
         reactors_.clear();
-        ::close(listenFd_); listenFd_ = -1;
+        closeListenSocket();
         life_.store(Life::Stopped, std::memory_order_release); return false;
     }
 
@@ -2140,9 +2188,7 @@ inline bool MultiReactorServer::start() noexcept {
     if (epollFd_ >= 0) {
         ::close(epollFd_); epollFd_ = -1;
     }
-    if (listenFd_ >= 0) {
-        ::close(listenFd_); listenFd_ = -1;
-    }
+    closeListenSocket();
     failed_.store(false, std::memory_order_release);
     life_.store(Life::Stopped, std::memory_order_release);
     return false;
@@ -2173,9 +2219,7 @@ inline void MultiReactorServer::stop() noexcept {
     if (epollFd_  >= 0) {
         ::close(epollFd_);  epollFd_  = -1;
     }
-    if (listenFd_ >= 0) {
-        ::close(listenFd_); listenFd_ = -1;
-    }
+    closeListenSocket();
 
     // 停所有 reactor（此时新的 sendTo / closeConnection 已被 isRunning() 拒绝）
     for (auto& r : reactors_) r->stop();
@@ -2351,9 +2395,7 @@ inline void MultiReactorServer::acceptLoop(std::promise<bool>& ready) noexcept {
     if (epollFd_ >= 0) {
         ::close(epollFd_); epollFd_ = -1;
     }
-    if (listenFd_ >= 0) {
-        ::close(listenFd_); listenFd_ = -1;
-    }
+    closeListenSocket();
 }
 
 inline bool MultiReactorServer::onConnectionOpened(uint64_t id,
@@ -2444,6 +2486,10 @@ inline bool MultiReactorServer::closeConnection(uint64_t connId) noexcept {
         return false;
     }
     return true;
+}
+
+inline uint16_t MultiReactorServer::port() const noexcept {
+    return boundPort_.load(std::memory_order_acquire);
 }
 
 inline size_t MultiReactorServer::connectionCount() const noexcept {
