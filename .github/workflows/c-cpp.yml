@@ -92,13 +92,20 @@ jobs:
           # Every [SKIP] line with the pass it happened in. Each configuration
           # announces itself with "---- running [title] ----", so whichever one
           # was last seen owns every line after it.
+          #
+          # The pattern is anchored, and had to be. The suite's skip() helper puts
+          # the marker first on the line, but the closing notes of
+          # verify/run-in-wsl.sh quote the same word in prose ("A [SKIP] line is
+          # a case that asked the machine a question first ...") -- as free text
+          # anywhere in the line, that paragraph counted itself as one case too,
+          # and reported a decline nobody had made.
           report=$(
               awk '
                 BEGIN { cfg="?" }
                 /^---- running \[/ {
                     cfg=$0; sub(/^---- running \[/,"",cfg); sub(/\].*/,"",cfg)
                 }
-                /\[SKIP\]/ { line=$0; sub(/^[ \t]+/,"",line); print cfg ": " line }
+                /^[ \t]*\[SKIP\]/ { line=$0; sub(/^[ \t]+/,"",line); print cfg ": " line }
               ' "$log"
           )
           echo "::group::cases that declined to assert"
