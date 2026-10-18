@@ -60,6 +60,7 @@ build() {
     g++ "${base_flags[@]}" "$@" verify/backpressure.cpp -o /tmp/backpressure
     g++ "${base_flags[@]}" "$@" -DINDUSTRIAL_TCP_TESTING verify/fault_injection.cpp \
         -o /tmp/fault_injection
+    g++ "${base_flags[@]}" "$@" verify/reactor_spread.cpp -o /tmp/reactor_spread
 }
 
 run_all() {
@@ -73,7 +74,9 @@ run_all() {
                    "ping_pong:/tmp/ping_pong" \
                    "send_results:/tmp/send_results" \
                    "backpressure:/tmp/backpressure" \
-                   "fault_injection:/tmp/fault_injection"; do
+                   "fault_injection:/tmp/fault_injection" \
+                   "reactor_spread, default reactors:/tmp/reactor_spread" \
+                   "reactor_spread, RS_REACTORS=2:env RS_REACTORS=2 /tmp/reactor_spread"; do
         local name="${attempt%%:*}"
         local cmd="${attempt#*:}"
         local rc=0
@@ -190,6 +193,12 @@ cat <<EOF
     acceptErrors in a forked child whose descriptor ceiling is below the number
     of peers knocking -- the one accept failure that is predictable at startup
     and leaves no other symptom.
+  - reactor_spread asks the one thing no other suite asked: which reactor owns a
+    connection. Eight connections over four reactors have to be handled by four
+    distinct threads -- that is pickReactor()'s round-robin, and an
+    implementation that always returned the first reactor leaves every other
+    suite green. It runs twice, at four reactors and at two, so the assertion is
+    shown to follow the configuration rather than a constant in the test.
   - A [SKIP] line is a case that asked the machine a question first and did not
     like the answer. It names what it checked. It is not a pass. send_results'
     hup/err case is one of these on hosts that report an aborted connection as
