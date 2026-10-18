@@ -74,6 +74,60 @@ LT 模式下对端 FIN 让 socket 永久可读，`EPOLLIN` 未摘 → 每次 `ep
    截图的建议“ENOENT 可以用 ADD 恢复，其他错误必须 abort”是对的，但没说清
    ENOENT 的后果方向相反——它不是“也自旋”，而是“全静默”。
 
+---
+
+# 第二轮外部审查：N1 / N2 / N3
+
+同一轮里用户带来第二张截图，列了三条。核实结论：**N1 成立（已修 `cd52cf8`）、
+N2 成立（已修 `1b173a6`）、N3 只是可选加固（已在 `1b173a6` 里补注释）**。
+
+## N1 — `drainInputThenClose` 在 backlog 未读完时就停靠（P2）
+
+**断言与实际的差别**：不是 FIN 抢在已排队应答之前，而是 backlog 尾部在 `closing`
+置位**之后**才被派发，其应答被 `submitSend` 拒绝。根因是 `handleRead` 每轮只处理
+`kFrameBudget=256` 帧 / `kReadBudget=64KB`，而 `drainInputThenClose` 只调它一次。
+
+证据 `verify/evidence/probe_close_backlog.cpp`（echo，首个帧触发 `closeConnection`，
+对端读到 EOF）：
+
+| N | 修复前应答 | 修复前 queueDrops / bytesDropped | 修复后 |
+|---|---|---|---|
+| 100 / 256 / 300 | 全应答 | 0 / 0 | 全应答 |
+| 600 | **512** | **88 / 3520** | 600 / 0 / 0 |
+| 1200 | **512** | **195~688**（时序相关） | 1200 / 0 / 0 |
+
+512 = 两轮预算。`dispatched` 恒等于 N：那些请求**进了 handler、跑了处理、应答被拒**，
+正是 L1488-1493 声称该函数要消灭的失败，只是从“队列顺序”换成了“读预算”这条路径。
+
+**修复**：input 仍未读完时不再停靠，而是再排一轮。轮次由 `Conn::closeInputBytes`
+界定——在关闭请求那一刻按 rbuf 已缓冲字节数取一次快照，每轮按“已派发帧数 ×
+FRAME_HEADER_SIZE”这个**下界**扣减（下界 = 只会让界偏松，不会提前收紧）。新到的
+输入不延长它，所以持续发送的对端仍不能把关闭无限拖住。
+
+**这条放宽必须有守卫**：原设计的“至多一轮”就是为了防止这件事。探针里的
+`runHostile()`（请求关闭后对端继续每 1ms 发 256 帧）实测 **FIN 在 87ms 后到达**
+（期间又服务了 47 个 burst，之后到达的按既有规则拒绝）——界的作用在此，它不是
+红→绿用例，而是防止将来有人把界去掉的守卫。
+
+## N2 — `disarmWrite` 两条注释都与代码不符（P3，纯文档）
+
+- “Targeted on the EPOLLOUT bit, **not on an 'armed' flag**” —— 下一行就是
+  `if (!c->writeArmed || c->fd < 0) return;`（注释由 `378183f7` 加，守卫来自更早的
+  `64d2435`，从未对齐）。它想说的是“标志是目标态而非开关”，已改写。
+- “Still has bytes to flush: keep the interest…” —— 它描述的
+  `if (!c->wbuf.empty() || c->fd < 0) return;` 由 `478e074` 引入、**被 `378183f7`
+  删除**，注释留在原地。守卫是有意去掉的（wbuf 还有字节时摘写兴趣等于把它们搁死），
+  两个调用点都已保证 wbuf 为空。已改写为说明“为什么这里不该有这个守卫”。
+
+行为未变，两个调用点（`handleWrite` 排空后、`finSent` 路径）本来就在 wbuf 已空之后。
+
+## N3 — `finishPeerClosed` 的 `fd < 0` 兜底（P4）
+
+不可达：`fd = -1` 只出现在 `unregisterConn()`（位于 `teardownClosed` 的 `isClosed`
+CAS **之后**）和 `Conn` 析构兜底，而函数开头已用 acquire 读过 `isClosed`。
+加注释说明为什么上面的 `if (c->fd >= 0)` 守卫要留着（将来若出现第二条 detach 路径，
+它才不会变成对 fd -1 的盲调用）。代码未动。
+
 ## 6. 附带发现（未在本提交处理）
 
 `verify/build.sh`（Windows 侧编译检查）在 HEAD `9c8200a` 上已经失败：
@@ -83,7 +137,7 @@ LT 模式下对端 FIN 让 socket 永久可读，`EPOLLIN` 未摘 → 每次 `ep
 
 ## 7. 回归
 
-`bash verify/run-in-wsl.sh`，`ENABLE_ASAN=1 ENABLE_TSAN=1`：
+两次（P1-1c 之后、N1+N2/N3 之后）各跑一遍 `ENABLE_ASAN=1 ENABLE_TSAN=1 bash verify/run-in-wsl.sh`：
 
 - plain / asan+ubsan / tsan × { close_semantics(默认, CS_REACTORS=1), backpressure,
   fault_injection } = 12 种配置，`rc=0`
