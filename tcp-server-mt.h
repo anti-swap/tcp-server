@@ -293,6 +293,16 @@ struct Conn {
     SubReactor* owner = nullptr;
 
     // reactor 线程独占
+    // Last time a byte arrived from this peer, not last time a frame was
+    // completed: an idle deadline is a promise about silence, and a peer
+    // dribbling one large frame over a slow link is not silent. Refreshed as
+    // soon as recv() hands us bytes (handleRead), and again in parseFrames as
+    // each frame completes -- the second is redundant for the timeout and kept
+    // because it is the only stamp a frame carries.
+    // Consequence: a peer that sends bytes which never complete a frame is now
+    // never idle-reclaimed. It is bounded by rbuf (a frame larger than
+    // rbufCapacity is closed as incomplete) and by TCP keepalive, not by the
+    // idle tick.
     int64_t    lastRecvMs = 0;
     RingBuffer rbuf;
     RingBuffer wbuf;
@@ -1108,6 +1118,12 @@ inline int SubReactor::handleRead(Conn* c) noexcept {
         if (n > 0) {
             c->rbuf.write(tmp, static_cast<size_t>(n));
             bytesLeft -= static_cast<int>(n);
+            // Stamped here, on arrival, rather than only when the bytes complete
+            // a frame: with the stamp in parseFrames alone, a frame that took
+            // longer than idleTimeoutMs to arrive was closed while it was still
+            // arriving -- the peer had never gone quiet and bytesRecv was still
+            // climbing. "Idle" means no bytes, and this is where bytes appear.
+            c->lastRecvMs = nowMs();
             server_->statsRef().bytesRecv.fetch_add(static_cast<uint64_t>(n),
                                                       std::memory_order_relaxed);
         } else if (n == 0) {
