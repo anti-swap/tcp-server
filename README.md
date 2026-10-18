@@ -87,10 +87,16 @@ were only never executed locally. The first of them now has been:
 
 Two remain open:
 
-- **Measured behaviour with several reactors**: the conclusions that depend on
-  reactor count were only ever run with `numReactors = 1`. More reactors does not
-  change the control flow of those functions -- they run only on the owning
-  thread -- but that has not been measured.
+- **Nothing asserts which reactor a connection lands on**: behaviour with
+  several reactors *is* measured -- `close_semantics` has defaulted to two since
+  the seventh round and the runner also takes it down to one on purpose, and
+  `fault_injection` and `compile_check` run at two -- but the round-robin itself
+  is observed by nothing. An implementation that always returned the first
+  reactor would leave every configuration green. What the single-reactor suites
+  (`send_results`, `backpressure`, `ping_pong`, `idle_semantics`) do not gain
+  from being run at N is the cross-thread path: the test thread is never a
+  reactor thread, so submission through the per-reactor queue and its eventfd is
+  exercised at any reactor count.
 - **One count folded into another**: a certain class of residual drops now lands
   in `queueDrops` / `bytesDropped`, counted the same as a genuine close branch.
   Under the current contract that is the same event; separating them would take a
