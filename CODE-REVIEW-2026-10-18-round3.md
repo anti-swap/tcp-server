@@ -5,7 +5,7 @@
 - 审查模式：full（完整模式）
 - 基线：`0c9d363 docs(review,verify): close out the second review round`
 - 性质：**第三轮复审**。第一轮（CODE-REVIEW.md）P0-1~P2-6、第二轮（CODE-REVIEW-2026-10-18.md）P1-1a/1b/1-4、P2-1~P2-5 均已修复并通过 plain / ASan+UBSan / TSan / cpplint。本轮在 2152 行的当前版本上重新扫描，只报**仍然存在或新发现**的问题。
-- **修复状态（当日完成）：P1 与 P2-6/7/8/9/10 全部修复，`18749fe..a8235dd` 共 10 笔提交**，每笔缺陷独立提交、可验证的均走红→绿。验证矩阵见文末。待核实 #1 已由维护者裁决关闭（见第三节）。
+- **修复状态（全部完成）：P1 与 P2-6/7/8/9/10 已由 `18749fe..a8235dd` 共 10 笔提交修复**；待核实 #1 由维护者裁决关闭；待核实 #2 / #3 由 `1f4f899`、`f27cfc1`、`7f5247a` 三笔关闭。至此第三轮清单归零，只剩上一轮有意保留的两项设计取舍。每笔缺陷独立提交，可验证的均走红→绿，验证矩阵见文末。
 
 ## 摘要
 
@@ -15,7 +15,7 @@
 | 规范匹配 | 无 `.coding-standards.md` → 启用内置宽松规范；另有项目级 `CPPLINT.cfg`（linelength=100）正在生效 |
 | 提交历史 | 最近一系列提交每次缺陷都配了独立的红色测试提交，无多次编辑压缩成一个 commit 的情况 |
 | 测试闭环 | **正常**。第二轮 6 个缺陷全部为红→绿两笔提交（`test(verify):` 先行、`fix(...)` 随后），有 WSL 执行记录，无"形式闭环" |
-| **缺陷统计** | **P0 = 0，P1 = 1，P2 = 5，待核实 = 3** |
+| **缺陷统计** | **P0 = 0，P1 = 1，P2 = 5，待核实 = 3 —— 全部已修复 / 关闭（13 笔提交），开放项仅剩上一轮的两项设计取舍** |
 | 本轮特殊性 | 有 1 项**初始推断被实测推翻并主动撤回**，见第五节 |
 
 > 这一轮刻意对每个推断都做了运行时验证而不是停在静态判断上。结果是 5 个候选缺陷里有 1 个是**我臆断的假警报**（EOF 后重复读），已删除。剩下的都带可复现的数字。
@@ -153,8 +153,8 @@ drainInputThenClose(raw);
 | # | 内容 | 为什么不能静态判定 |
 |---|---|---|
 | 1 | **已裁决关闭（维护者）**：`lastRecvMs` 按字面意思就是"最后收到的时间"，实现与命名一致，发送侧不计活动是命名本身宣称的语义，不构成缺陷。后续若产品需要"双向静默才算 idle"，再引入独立字段，不覆写这个。 | — |
-| 2 | `doTick()`（range-for）的安全依赖一条**没有注释也没有断言的不变量**："仍在 `conns_` 里的连接，若 `finSent` 则必 `closing`"。违反时 `closeConn → teardownClosed` 会在迭代中 erase，迭代器失效。目前成立（设置 `finSent` 的三个调用点都先设了 `closing`），但这是隐式的。 | 不变量跨 5 个函数，静态难以证否，也无法保证未来改动不破坏。建议加 `assert(!(c->finSent && !c->closing))` 把约定变成可检查的事实。**本轮未改**（不在约定的修复顺序内）。 |
-| 3 | `drainWbufToSocket` 的 EPIPE 分支（L977 返回 0）保留 EPOLLOUT 挂载，`handleWrite`（L1070）随即 return → 下一次 `epoll_wait` 立即返回。**讨论**：EPIPE 在本机几乎必然伴随 `finSent`（本地 `shutdown(SHUT_WR)`）或 `EPOLLERR/EPOLLHUP`（对端 RST），而前者被 `handleWrite` 开头 L1063 挡掉、后者被 `loop()` 的 L1616 抢先处理。因此大概率不可达，但无法证明。 | 需要能造出"既无 finSent 又无 HUP/ERR 却 EPIPE"的场景才能判定；静态排不掉极窄窗口。建议加一行防御（EPIPE 时也 `disarmWrite`）而不是留着。 |
+| 2 | **已修复（`1f4f899` + `f27cfc1`）**：`doTick()` 的 range-for 里调用 `closeConn`，而 `teardownClosed` 会从正在被迭代的 `conns_` 里 erase。安全性依赖"仍在 `conns_` 里的连接若 `finSent` 则必 `closing`"这条既不注释也不检查的不变量。 | 不变量跨 5 个函数，静态难以证否。用注入证明危险为真（`check_doTick_invariant.sh`：before = ASan heap-use-after-free，after = rc=0），并把到期关闭移到 sweep 之外执行——erase 在活迭代器下结构上不可能发生，强于原建议的 assert（NDEBUG 下会被编译掉）。详见第六节。 |
+| 3 | **已修复（`7f5247a`）**：原判断"`drainWbufToSocket` 的 EPIPE 分支仅保留 EPOLLOUT 挂载"漏了更根本的东西——**该函数的两种零结局共用返回值 0**：wbuf 排空、以及 EPIPE。调用方能分清全靠"EPIPE 在循环内返回，故 wbuf 必非空"这个没人写下来的耦合。 | 「建议加一行 `disarmWrite`」是错的：`disarmWrite` 在 `wbuf` 非空时直接 return，那样改是空操作；若强行放开，它又会把掩码改回 `EPOLLIN`，在 P1-1b 修过的 peer-FIN 停靠场景里把读自旋放回来。改为把结局命名为 `DrainOutcome::{Drained,Stalled,Dead,Error}`，`Dead` 在两处调用点作终态处理。详见第六节。 |
 
 ## 四、上一轮遗留的两项（本轮维持开放，未重复计入）
 
@@ -179,6 +179,23 @@ drainInputThenClose(raw);
 | P2-7 不可达分支 | — | `a32fc3d` | case E 回归通过、断言未触发（eofReads 探针由 case E 持续把守） |
 | P2-9 backlog 校验 | `925d6f8` | `da11778` | case D：0/-1 被接受 → 均被拒绝；tick 告警在套件内真触发且不误报 |
 | P2-10 内存序 | — | `a8235dd` | TSan 全量回归通过（无新增报告） |
+| 待核实 #2 doTick 迭代 erase | `1f4f899` | `f27cfc1` | 注入不变量破坏：before = ASan heap-use-after-free，after = rc=0（`accepted=24 closed=24 stillOpen=0`） |
+| 待核实 #3 drain 结局共用 0 | — | `7f5247a` | 结局命名后套件全绿；5 种"对端消失"构造实测 `epipeWrites` 仍为 0（不可达由计数器持续看守） |
+
+### 一个沿路的自我纠错（第三个例子）
+
+原报告建议给 EPIPE 分支"加一行 `disarmWrite`"。照做之前先读 `disarmWrite`，发现两件事使其不可行：
+
+1. 它开头就有 `if (!c->wbuf.empty()) return;`——而 EPIPE 恰恰只在 `wbuf` 非空时到达，所以这行防御是**空操作**；
+2. 若为了让它能生效而放宽这个守卫，它会把事件掩码 MOD 成 `EPOLLIN`，在 P1-1b 修过的"peer FIN 停靠排空"场景里把**读自旋**又放回来——用一个新自旋去换一个旧自旋。
+
+顺着往下查才看清真正的病灶：两个结局共用返回值 0。这也解释了为什么没人动过它——按接口的字面读法去改，一定改错。第一版修法就是把 0 当作了"写失败"的终态，结果把**每一次健康排空都变成了一次中止**，四条 close_semantics 断言同时转红（包括第二轮修的两条：'every queued reply survived the peer's half-close'、'no round loses an answer it had already produced'）。
+
+沉淀：**一个返回值承担两种语义时，调用方的任何加固都是在赌运气。** 先把结局分开命名（`DrainOutcome`），再谈处理。
+
+### 关于"不可达"的表述边界
+
+`epipeWrites` 五种构造全为 0，只能说明**没触发成功**，不能证明不可达。加这个计数器的用意正是让这个判断保持可测量：一旦哪天它动了，说明上面的守卫推理失效，需要回头复查 `DrainOutcome::Dead` 的处置是否还够。同理 `eofReads=1` 说明五种场景里对端 FIN 都被正常识别且没有出现读自旋。
 
 ### 验证矩阵（最终回归，全部通过）
 
@@ -193,6 +210,5 @@ Result: all configurations passed
 
 ### 仍然开放（有意未改）
 
-1. **待核实 #2**：`doTick` 的 finSent⟹closing 不变量建议加 assert——属小重构，未在本轮约定顺序内。
-2. **待核实 #3**：EPIPE 分支保留 EPOLLOUT 的窄自旋窗口——大概率不可达，可顺手加一行防御，同上未排。
-3. **上一轮遗留两项**：用户回调抛异常杀死 reactor（文档化契约，不改）；`wait()` 200ms 轮询（已知取舍）。
+1. **上一轮遗留两项**：用户回调抛异常杀死 reactor（文档化契约，静默吞掉会掩盖应用层 bug）；`wait()` 200ms 轮询（已知设计取舍）。
+2. 待核实 #2、#3 已于本日关闭，见上表与第六节的单独说明。
