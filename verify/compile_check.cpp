@@ -2,7 +2,7 @@
 // platform shim so g++ can type-check it on a non-Linux host.
 // Build: see verify/build.sh
 #define __linux__ 1
-#include "../tcp-server-mt.h"
+#include "tcp-server-mt.h"
 
 int main() {
     industrial::MultiReactorServer::Config cfg;

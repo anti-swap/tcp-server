@@ -71,7 +71,7 @@
 #include <thread>
 #include <vector>
 
-#include "../../tcp-server-mt.h"
+#include "tcp-server-mt.h"
 
 // Plain globals: read from inside the linker wrappers, which must have C
 // linkage and therefore cannot capture anything.

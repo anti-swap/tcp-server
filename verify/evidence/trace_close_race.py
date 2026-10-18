@@ -18,9 +18,11 @@
 # Usage:
 #   python3 verify/evidence/trace_close_race.py <header-in> <header-out>
 #
-# Then build the traced copy against close_semantics.cpp: the test includes
-# "../tcp-server-mt.h", so layout has to be <dir>/tcp-server-mt.h plus
-# <dir>/verify/close_semantics.cpp -- see loop_close_race.sh.
+# Then build the traced copy against close_semantics.cpp. The test includes the
+# header by bare name now, so the build carries -I<dir> and the layout is
+# <dir>/tcp-server-mt.h plus <dir>/verify/close_semantics.cpp. Until 2026-10-18
+# the include was "../tcp-server-mt.h", relying on the directory shape alone --
+# see loop_close_race.sh.
 import sys
 
 PATCHES = [

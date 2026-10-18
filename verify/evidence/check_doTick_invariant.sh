@@ -31,14 +31,31 @@ FLAGS=(-std=c++17 -Wall -Wextra -Wpedantic -Wshadow -pthread -g
 rm -rf /tmp/dti_before /tmp/dti_after
 mkdir -p /tmp/dti_before/verify/evidence /tmp/dti_after/verify/evidence
 
-git show "$BEFORE_REF":tcp-server-mt.h > /tmp/dti_before/tcp-server-mt.h || exit 9
-cp "$PROJ/tcp-server-mt.h"     /tmp/dti_after/tcp-server-mt.h
+# The header moved to include/ on 2026-10-18. Every rev before that still has it
+# at the repository root, and `git show` to a path a rev does not carry simply
+# fails -- so ask which one exists instead of assuming. A probe that only works
+# on half the history is a probe that quietly stops being evidence.
+hdr_in() {
+  for p in include/tcp-server-mt.h tcp-server-mt.h; do
+    if git cat-file -e "$1:$p" 2>/dev/null; then printf '%s' "$p"; return 0; fi
+  done
+  echo "check_doTick_invariant: no tcp-server-mt.h in $1" >&2
+  return 1
+}
+HDR_BEFORE=$(hdr_in "$BEFORE_REF") || exit 9
+HDR_AFTER=include/tcp-server-mt.h
+[ -f "$HDR_AFTER" ] || HDR_AFTER=tcp-server-mt.h
+
+git show "$BEFORE_REF:$HDR_BEFORE" > /tmp/dti_before/tcp-server-mt.h || exit 9
+cp "$PROJ/$HDR_AFTER"              /tmp/dti_after/tcp-server-mt.h
 
 for label in before after; do
   python3 "$INJ" /tmp/dti_$label/tcp-server-mt.h /tmp/dti_$label/tcp-server-mt.h || exit 9
   mkdir -p /tmp/dti_$label/verify/evidence
   cp "$SRC" /tmp/dti_$label/verify/evidence/ || exit 9
-  ( cd /tmp/dti_$label && g++ "${FLAGS[@]}" verify/evidence/repro_doTick_erase.cpp \
+  # -I. matters now: the sources include the header by bare name, and the copy
+  # under test sits at the root of this throwaway tree, not beside the .cpp.
+  ( cd /tmp/dti_$label && g++ "${FLAGS[@]}" -I. verify/evidence/repro_doTick_erase.cpp \
       -o /tmp/dti_bin_$label ) || exit 9
 done
 

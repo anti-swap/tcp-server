@@ -42,8 +42,10 @@ if ! command -v g++ >/dev/null 2>&1; then
 fi
 g++ --version | head -1
 
-# A combine the switches the way every run needs them, plus the ones requested.
-base_flags=(-std=c++17 -Wall -Wextra -Wpedantic -Wshadow -pthread)
+# Every build below runs from the project root, so `include` resolves against
+# it. Sources include the header by bare name; the ../.. arithmetic that used
+# to sit in twenty files was the thing that made any move expensive.
+base_flags=(-std=c++17 -Wall -Wextra -Wpedantic -Wshadow -pthread -Iinclude)
 
 # The test uses the same switches to build, so both must agree on the macro or
 # the harness silently compiles itself away. It cannot: fault_injection.cpp
@@ -116,7 +118,7 @@ run_cpplint() {
     fi
     echo "  control: $control findings, as expected"
 
-    out=$(python3 -m cpplint --quiet tcp-server-mt.h 2>&1)
+    out=$(python3 -m cpplint --quiet include/tcp-server-mt.h 2>&1)
     case "$out" in
         *Traceback*|*"No such file"*|*"command not found"*)
             echo "  [FAIL] cpplint did not run:"

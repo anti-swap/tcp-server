@@ -47,7 +47,13 @@ if [ ! -x "$CXX" ]; then
   exit 2
 fi
 
-flags=(-std=c++17 -c -Wall -Wextra -Wpedantic -Wshadow -D__linux__ -I "$HERE_W/stub")
+# Two search paths, and they solve different problems. stub/ holds the
+# declarations the header expects from a POSIX box that Windows does not have;
+# include/ is where the header itself lives. Sources say
+# `#include "tcp-server-mt.h"` against the latter rather than counting ../../,
+# so moving anything later does not take twenty edits with it.
+flags=(-std=c++17 -c -Wall -Wextra -Wpedantic -Wshadow -D__linux__ \
+       -I "$HERE_W/stub" -I "$(to_win "$root/include")")
 
 # One TU. Extra flags are per-file rather than per-script: fault_injection.cpp
 # refuses to compile without the macro that opens the header's test switches,

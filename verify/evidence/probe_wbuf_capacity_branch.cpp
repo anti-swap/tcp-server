@@ -39,7 +39,7 @@
 #include <thread>
 #include <vector>
 
-#include "../../tcp-server-mt.h"
+#include "tcp-server-mt.h"
 
 using industrial::MultiReactorServer;
 

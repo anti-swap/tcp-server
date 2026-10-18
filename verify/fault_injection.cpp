@@ -50,7 +50,7 @@
 #error "fault_injection.cpp requires -DINDUSTRIAL_TCP_TESTING; see the file header"
 #endif
 
-#include "../tcp-server-mt.h"
+#include "tcp-server-mt.h"
 
 using industrial::MultiReactorServer;
 
