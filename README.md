@@ -55,6 +55,15 @@ CI runs the Linux half on every push and pull request -- see
 exists because this particular desk is not Linux, not because Linux lacks
 anything.
 
+`verify/bench.sh` is the third kind of check, and it is deliberately not in CI:
+it measures resident memory per idle connection, ingest rate at one, two and
+four reactors, and the echo round trip at p50 and p99. A shared runner hands its
+cores to other tenants, so a threshold there would fail on someone else's load
+rather than on a regression. The numbers are worth having when they are compared
+against numbers taken on the same machine minutes earlier -- which is why none
+of them are written down here. Each change that moves them records the before
+and after in its commit message, where the date and the machine are attached.
+
 ## Layout
 
 ```
