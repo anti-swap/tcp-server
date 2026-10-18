@@ -14,9 +14,14 @@
 # it (after: clean).
 #
 # Usage:
-#   bash verify/evidence/check_doTick_invariant.sh
+#   bash verify/evidence/check_doTick_invariant.sh [ref-for-before]
+#
+# Pass the revision to test against once the fix is in: left to default to HEAD
+# it would compare the fix with itself. The commit whose doTick still closed
+# in-loop is 1f4f899^ HEAD-side, i.e. any tree before f27cfc1.
 set -u
 PROJ=${PROJ:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}
+BEFORE_REF=${1:-HEAD}
 cd "$PROJ" || exit 9
 SRC=verify/evidence/repro_doTick_erase.cpp
 INJ=verify/evidence/inject_fin_without_closing.py
@@ -24,15 +29,16 @@ FLAGS=(-std=c++17 -Wall -Wextra -Wpedantic -Wshadow -pthread -g
        -fsanitize=address,undefined -fno-omit-frame-pointer)
 
 rm -rf /tmp/dti_before /tmp/dti_after
-mkdir -p /tmp/dti_before/verify /tmp/dti_after/verify
+mkdir -p /tmp/dti_before/verify/evidence /tmp/dti_after/verify/evidence
 
-git show HEAD:tcp-server-mt.h > /tmp/dti_before/tcp-server-mt.h || exit 9
+git show "$BEFORE_REF":tcp-server-mt.h > /tmp/dti_before/tcp-server-mt.h || exit 9
 cp "$PROJ/tcp-server-mt.h"     /tmp/dti_after/tcp-server-mt.h
 
 for label in before after; do
   python3 "$INJ" /tmp/dti_$label/tcp-server-mt.h /tmp/dti_$label/tcp-server-mt.h || exit 9
-  cp "$SRC" /tmp/dti_$label/verify/ || exit 9
-  ( cd /tmp/dti_$label && g++ "${FLAGS[@]}" verify/repro_doTick_erase.cpp \
+  mkdir -p /tmp/dti_$label/verify/evidence
+  cp "$SRC" /tmp/dti_$label/verify/evidence/ || exit 9
+  ( cd /tmp/dti_$label && g++ "${FLAGS[@]}" verify/evidence/repro_doTick_erase.cpp \
       -o /tmp/dti_bin_$label ) || exit 9
 done
 
