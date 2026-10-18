@@ -539,8 +539,13 @@ class MultiReactorServer {
     // sendTo/closeConnection are permitted. stop from a callback requests shutdown
     // only; the controlling thread must subsequently call stop to join threads.
     // Close/state-false callbacks are deferred: they run on the worker thread
-    // after the closing connection's stack frame has unwound, so they may drop
-    // the last external owner of this server.
+    // after the closing connection's stack frame has unwound. That deferral is
+    // what makes stop() from a callback safe -- the callback is off the
+    // connection's stack -- and it is NOT a licence to destroy the server: the
+    // callback still runs on a thread this server owns, and destroying it there
+    // leaves that thread joinable, which terminates the process. The last
+    // external owner may only be released after the controlling thread's stop()
+    // has returned; ~MultiReactorServer names the violation if it happens.
     using MessageHandler   = std::function<void(uint64_t, const uint8_t*, size_t)>;
     using ConnStateHandler = std::function<void(uint64_t, const std::string&, bool)>;
     using CloseHandler = std::function<void(uint64_t, const std::string&, const char*)>;
@@ -587,7 +592,28 @@ class MultiReactorServer {
     };
 
     explicit MultiReactorServer(Config cfg) noexcept : cfg_(std::move(cfg)) {}
-    ~MultiReactorServer() noexcept { stop(); }
+    // Destroying from inside a callback cannot work, and it must not be quiet
+    // about it. stop() below declines to join the calling thread -- a thread
+    // cannot join itself -- so acceptThread_ is still joinable when this body
+    // returns, and std::thread::~thread calls std::terminate(). That message,
+    // "terminate called without an active exception", names neither this server
+    // nor the reason; a reader who cannot tell what died learns nothing. Say it
+    // here, then let the terminate happen: there is no correct recovery -- the
+    // fix is for the last owner to be released after the controlling thread's
+    // stop() has joined, which is what the contract above now asks for.
+    ~MultiReactorServer() noexcept {
+        if (callbackServer_ == this) {
+            std::fprintf(stderr,
+                         "[fatal] MultiReactorServer destroyed from inside its "
+                         "own callback: stop() cannot join the calling thread, "
+                         "so the accept/worker threads are still joinable and "
+                         "std::thread::~thread is about to terminate. Call "
+                         "stop() from the controlling thread, and release the "
+                         "last owner only after it has returned.\n");
+            std::fflush(stderr);
+        }
+        stop();
+    }
 
     MultiReactorServer(const MultiReactorServer&) = delete;
     MultiReactorServer& operator=(const MultiReactorServer&) = delete;
