@@ -330,7 +330,12 @@ struct Conn {
     // The two are separate on purpose: "closed" must not mean "socket is gone",
     // or an application that sends a reply and then closes would never get the
     // reply out. Reads keep running throughout.
-    bool       closing = false;
+    // Atomic, though every write is reactor-thread-only: sendTo() reads it, and
+    // sendTo runs on whichever thread the application called it from. The two
+    // have to agree, because once this is set the reactor refuses every frame
+    // (see submitSend) -- sendTo answering Ok to one would promise something
+    // the owner has already decided not to do.
+    std::atomic<bool> closing{false};
     bool       finSent = false;
     // A graceful close whose final read dispatched requests: their replies are
     // still queued, and the FIN waits for them. Bounds the wait to one round --
@@ -977,7 +982,8 @@ inline bool SubReactor::submitSend(uint64_t id,
             // submitClose only marks the connection and then returns to this batch,
             // so this task runs first. Anything arriving after that point is
             // refused here -- the FIN is already reserved for what we owe the peer.
-            if (c->isClosed.load(std::memory_order_acquire) || c->closing) {
+            if (c->isClosed.load(std::memory_order_acquire) ||
+                c->closing.load(std::memory_order_acquire)) {
                 c->pendingBytes.fetch_sub(f.size(), std::memory_order_relaxed);
                 // One refusal, two questions, two counters: how many replies
                 // never went out (queueDrops) and how much data the peer never
@@ -1288,7 +1294,7 @@ inline void SubReactor::handleWrite(Conn* c) noexcept {
     // the only place a FIN may be sent. A non-closing connection just drops its
     // write interest here; a parked close turns into a half-close.
     disarmWrite(c);
-    if (c->closing && !tryBeginWriteShutdown(c)) {
+    if (c->closing.load(std::memory_order_acquire) && !tryBeginWriteShutdown(c)) {
         // shutdown() failed on a socket that was writable a moment ago: the only
         // way left to end this connection is a reset, which is at least honest.
         teardownClosed(c, "shutdown failed", false);
@@ -1383,7 +1389,7 @@ inline void SubReactor::finishPeerClosed(Conn* c) noexcept {
         // so that adding one cannot turn into a blind epoll_ctl on fd -1.
         return;                    // parked close finishes in handleWrite
     }
-    if (!c->closing && !c->waitingOnReplies &&
+    if (!c->closing.load(std::memory_order_acquire) && !c->waitingOnReplies &&
         c->pendingBytes.load(std::memory_order_relaxed) > 0) {
         c->waitingOnReplies = true;
         const uint64_t id = c->id;
@@ -1400,7 +1406,7 @@ inline void SubReactor::finishPeerClosed(Conn* c) noexcept {
         // The hand-off failed (queue full, or the reactor is going down): a
         // late FIN beats an answer nobody can wait for any longer.
     }
-    if (c->closing && !c->finSent) {
+    if (c->closing.load(std::memory_order_acquire) && !c->finSent) {
         // Still closing on our side and the peer declared itself done too: the
         // only thing left is the FIN. Anything a handler queued was drained above
         // or is still passing through the socket buffer, ahead of it.
@@ -1460,7 +1466,7 @@ inline void SubReactor::parseFrames(Conn* c, int& framesLeft) noexcept {
                 c->pendingBytes.fetch_sub(pong.size(), std::memory_order_relaxed);
                 closeConn(c, "wbuf full on pong", false); return;
             }
-            if (c->closing) {
+            if (c->closing.load(std::memory_order_acquire)) {
                 // Mid-close: the FIN is already (or about to be) behind everything
                 // we owe the peer. Queueing a PONG after it would either be sent
                 // past the FIN -- which the kernel refuses -- or silently lost.
@@ -1518,7 +1524,7 @@ inline void SubReactor::unregisterConn(Conn* c, bool graceful) noexcept {
     ::close(c->fd);
     c->fd = -1;
     c->writeArmed = false;
-    c->closing  = false;
+    c->closing.store(false, std::memory_order_release);
 }
 
 // pendingBytes is reserved at enqueue time and released on two paths only:
@@ -1589,8 +1595,9 @@ inline void SubReactor::closeConn(Conn* c, const char* reason, bool graceful) no
 // first FIN is still in flight) must not restart the drain or skip it.
 inline void SubReactor::parkClose(Conn* c, const char* reason) noexcept {
     if (c->isClosed.load(std::memory_order_acquire) || c->finSent) return;
-    if (!c->closing) {
-        c->closing = true; c->closeStartedAtMs = nowMs();
+    if (!c->closing.load(std::memory_order_acquire)) {
+        c->closing.store(true, std::memory_order_release);
+        c->closeStartedAtMs = nowMs();
     }
     // Hand over what is already queued; whatever does not fit in the socket
     // buffer stays in wbuf and is finished by handleWrite (EPOLLOUT armed).
@@ -1853,7 +1860,7 @@ inline void SubReactor::doTick() noexcept {
     std::vector<std::shared_ptr<Conn>> expired;   // past its deadline: forced
     for (auto& kv : conns_) {
         Conn* c = kv.second.get();
-        if (c->closing) {
+        if (c->closing.load(std::memory_order_acquire)) {
             // A closing connection has a deadline regardless of which stage it
             // reached, and it is the same value for both: how long the close may
             // take. lastRecvMs is useless here (the peer has nothing left to
@@ -2430,7 +2437,14 @@ inline SendResult MultiReactorServer::sendTo(uint64_t connId,
         if (it == conns_.end()) return SendResult::NotConnected;
         c = it->second;
     }
-    if (c->isClosed.load(std::memory_order_acquire)) return SendResult::Closed;
+    // The same two conditions submitSend() will apply on the owner's thread,
+    // applied here: `closing` is part of it because a connection whose graceful
+    // close has been parked is refused there without exception, so Ok here
+    // would describe a frame that is going into bytesDropped on arrival. This
+    // is not a shutdown or a disconnection that Ok is allowed to be vague
+    // about -- it is the close this caller asked for moments ago.
+    if (c->isClosed.load(std::memory_order_acquire) ||
+        c->closing.load(std::memory_order_acquire)) return SendResult::Closed;
 
     std::vector<uint8_t> frame;
     try {

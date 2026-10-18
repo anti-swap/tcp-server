@@ -178,23 +178,28 @@ void caseSendResults() {
     std::printf("   after saturating maxPendingBytes: %s\n",
                 name(server.sendTo(id, "abcd", 4)));
 
-    // Now close it and send again. The question is not what sendTo answers --
-    // it is whether what it answered Ok to actually reached the socket.
+    // Now close it and send again. The question is not only what sendTo answers
+    // -- it is whether what it answered Ok to reached the socket at all.
+    server.closeConnection(id);
+    // Long enough for the close to be in effect and for the backlog above to
+    // have been refused: those drops belong to the close, not to the send under
+    // test, and only a baseline taken after they land can say which is which.
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+
     const unsigned long long qd0 = server.stats().queueDrops.load();
     const unsigned long long bd0 = server.stats().bytesDropped.load();
     const unsigned long long bs0 = server.stats().bytesSent.load();
     const unsigned long long cl0 = server.stats().closed.load();
 
-    server.closeConnection(id);
-    std::this_thread::sleep_for(std::chrono::milliseconds(300));
-    std::printf("   closeConnection() -> %s, still in the connection table: %s\n",
-                server.closeConnection(id) ? "true" : "false",
-                server.connectionCount() ? "yes" : "no");
+    check(server.connectionCount() == 1, "the closing connection is still in the table");
     const SendResult after = server.sendTo(id, "abcd", 4);
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    std::printf("   sendTo() to a connection whose close is in progress: %s\n",
-                name(after));
-    std::printf("     and what that Ok bought: bytesSent +%llu, queueDrops +%llu, "
+    check(after == SendResult::Closed,
+          "sendTo() to a connection whose close is in progress: Closed, not Ok");
+    check(server.stats().queueDrops.load() - qd0 == 0 &&
+          server.stats().bytesDropped.load() - bd0 == 0,
+          "and what it answered bought no drops either");
+    std::printf("     bytesSent +%llu, queueDrops +%llu, "
                 "bytesDropped +%llu, closed +%llu\n",
                 server.stats().bytesSent.load() - bs0,
                 server.stats().queueDrops.load() - qd0,
