@@ -975,12 +975,33 @@ inline bool SubReactor::submitNewConnection(
                 // rejects it, otherwise accepted - closed stops matching reality.
                 server_->statsRef().accepted.fetch_add(1, std::memory_order_relaxed);
 
+                // Nothing after this line may count rejected. Every earlier
+                // failure returns while the socket is still unregistered or rolls
+                // back through discardRejectedConn(); from here the connection is
+                // in both maps, owns its epoll registration, answers
+                // connectionCount(), can be sent to, and will be counted in
+                // closed when it goes. So if the state callback throws now,
+                // incrementing rejected too would make the two counters
+                // contradict each other about one live connection -- and accepted
+                // is the one telling the truth, which leaves rejected as the
+                // counter an operator reads to look for clients being turned
+                // away. (Nothing counts the throw either: ServerStats has no slot
+                // for "the application's callback threw" that would not read as a
+                // claim about this server, and the caller's own handler is where
+                // the exception belongs -- swallowing it here is exactly what lets
+                // whoever wrote it find out.)
                 auto& sh = server_->stateHandlerRef();
-                if (sh) sh(id, c->peer, true);
-            } catch (...) {
-                    // Before registration, the socket guard closes on failure.
-                    server_->statsRef().rejected.fetch_add(1, std::memory_order_relaxed);
+                if (sh) {
+                    try {
+                        sh(id, c->peer, true);
+                    } catch (...) {
+                        // See above: nothing to undo, nothing to count.
+                    }
                 }
+            } catch (...) {
+                // Before registration, the socket guard closes on failure.
+                server_->statsRef().rejected.fetch_add(1, std::memory_order_relaxed);
+            }
             };   // NOTE: accepted is bumped inside, not by the accept loop
     } catch (...) {
         // Local guards retain ownership if constructing the task fails. No
