@@ -28,6 +28,13 @@
 //      SUBMIT_SEND(answer A) SUBMIT_CLOSE SUBMIT_SEND(answer B) TASK_SEND(A)
 //      PARK_IMMEDIATE TASK_SEND(B) -> REFUSE, 11 of 22 bytes delivered.
 //      One round mostly misses it; twenty mostly do not.
+//   G. The two sent-counters must describe one exchange, not two. framesSent
+//      used to move when a frame entered wbuf while bytesSent moved when bytes
+//      left the socket, and nothing ever subtracted a frame a later abort
+//      dropped: 255 frames "sent", 96 delivered, no way to reconcile. Both
+//      now move at the kernel boundary, so with uniform frames framesSent
+//      must equal bytesSent / wireSize -- exactly, whatever the socket buffer
+//      happened to absorb.
 //
 // Build (Linux only):
 //   g++ -std=c++17 -Wall -Wextra -pthread verify/close_semantics.cpp -o close_semantics
@@ -560,6 +567,61 @@ int main() {
                     lost, rounds);
         expect(lost == 0, "no round loses an answer it had already produced");
         dumpStats(server, "F.end");
+    }
+
+    // ---- G: the sent-counters describe one exchange, not two ---------------
+    //
+    // A peer that never reads forces the close to park on a full wbuf, and the
+    // linger deadline then aborts it with output undelivered -- exactly the
+    // situation someone would consult framesSent to understand. Every reply
+    // frame here is the same wire size, and at most one frame is ever mid-
+    // flight, so if framesSent really counts frames that left the socket,
+    // bytesSent / wireSize names the same number.
+    {
+        std::printf("G. counters across an aborted drain\n");
+        MultiReactorServer::Config gcfg;
+        gcfg.bindAddr = "127.0.0.1";
+        gcfg.port = pickPort();
+        gcfg.numReactors = 1;
+        gcfg.idleTimeoutMs = 300;   // parks the close while output is stuck
+        gcfg.closeLingerMs = 200;   // then expires it: abort with wbuf loaded
+        gcfg.tickMs = 20;
+        gcfg.wbufCapacity = 32 * 1024 * 1024;
+        gcfg.maxPendingBytes = 32 * 1024 * 1024;
+
+        MultiReactorServer gserver(gcfg);
+        gserver.setMessageHandler([&](uint64_t id, const uint8_t*, size_t) {
+            // ~33MB of answer against a peer that will not read a byte: the
+            // socket buffer takes what it takes, everything else waits in
+            // wbuf for the linger deadline.
+            const std::string blob(industrial::MAX_FRAME_PAYLOAD, 'g');
+            for (int i = 0; i < 512; ++i)
+                if (gserver.sendTo(id, blob.data(), blob.size()) != SendResult::Ok) break;
+        });
+        expect(gserver.start(), "second server starts");
+        int gfd = connectTo(gcfg.port);
+        expect(gfd >= 0, "client connects");
+        sendAll(gfd, encode(FrameType::DATA, "go", 2));
+        // Read nothing on purpose: idle (300ms) parks the close, linger
+        // (200ms) aborts it, the rest is margin for the tick.
+        std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+
+        const auto& gst = gserver.stats();
+        const uint64_t wire = industrial::FRAME_HEADER_SIZE + industrial::MAX_FRAME_PAYLOAD;
+        const uint64_t fsent = gst.framesSent.load();
+        const uint64_t bsent = gst.bytesSent.load();
+        std::printf("      framesSent=%llu bytesSent=%llu bytesDropped=%llu aborted=%llu\n",
+                    (unsigned long long)fsent, (unsigned long long)bsent,
+                    (unsigned long long)gst.bytesDropped.load(),
+                    (unsigned long long)gst.aborted.load());
+        expect(gst.aborted.load() >= 1, "the linger deadline aborted the parked close");
+        expect(gst.bytesDropped.load() > 0, "output was still undelivered at the abort");
+        expect(bsent > 0, "some output did reach the socket");
+        expect(fsent == bsent / wire,
+               "framesSent counts frames that left, not frames that were queued");
+
+        ::close(gfd);
+        gserver.stop();
     }
 
     // ---- D: accounting ------------------------------------------------------
