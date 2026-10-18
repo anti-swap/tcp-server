@@ -18,7 +18,9 @@
 //      is the only shape "recoverable" can take that anyone would rely on.
 //   D. closeLingerMs <= 0 must be refused at start(): doTick only sweeps a parked
 //      close when linger > 0, so a non-positive value turns every peer that never
-//      answers our FIN into a permanent fd + admission leak.
+//      answers our FIN into a permanent fd + admission leak. Same for backlog <= 0:
+//      listen() takes the value as given, and a zero-length accept queue looks
+//      exactly like a server that randomly refuses connections under load.
 //
 // Build (Linux only), one line, so nothing here can be copied wrong:
 //   g++ -std=c++17 -Wall -Wextra -pthread -DINDUSTRIAL_TCP_TESTING verify/fault_injection.cpp -o fault_injection
@@ -224,6 +226,23 @@ int main() {
         MultiReactorServer serverOk(cfg);
         expect(serverOk.start(), "closeLingerMs=1 still accepted");
         if (serverOk.isRunning()) serverOk.stop();
+
+        // The one accept-side setting that silently degrades: Linux clamps
+        // backlog only from above (somaxconn), so 0 goes through as a
+        // zero-length queue.
+        cfg.closeLingerMs = 5000;
+        cfg.backlog = 0;
+        MultiReactorServer serverB0(cfg);
+        expect(!serverB0.start(), "backlog=0 refused");
+
+        cfg.backlog = -1;
+        MultiReactorServer serverBNeg(cfg);
+        expect(!serverBNeg.start(), "backlog=-1 refused");
+
+        cfg.backlog = 1;
+        MultiReactorServer serverBOk(cfg);
+        expect(serverBOk.start(), "backlog=1 still accepted");
+        if (serverBOk.isRunning()) serverBOk.stop();
     }
 
     std::printf("%s (%d failure%s)\n", gFailures == 0 ? "ALL PASS" : "FAILURES",
