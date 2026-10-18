@@ -188,21 +188,41 @@ void caseWhileClosing() {
     (void)sendAll(fd, hello.data(), hello.size());
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
+    // closeConnection() only asks: the close reaches the connection through the
+    // reactor's queue, so a PING already in flight may legitimately be answered
+    // before it takes effect. Asserting on what happens from the moment of the
+    // request would be asserting on that race, and it does go both ways (5/0,
+    // 3/2 and 4/1 across three runs).
+    //
+    // So: PING until one is counted as dropped, which is the observable point at
+    // which the close is in effect, and assert about everything after that.
     server.closeConnection(id.load());
+    unsigned long long dropped = 0;
+    for (int i = 0; i < 20 && dropped == 0; ++i) {
+        const std::vector<uint8_t> f = frame(FrameType::PING, nullptr, 0);
+        if (!sendAll(fd, f.data(), f.size())) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        dropped = server.stats().framesDroppedOnClose.load();
+    }
+    const unsigned long long sentAfterCloseBegan = server.stats().framesSent.load();
+
     for (int i = 0; i < 5; ++i) {
         const std::vector<uint8_t> f = frame(FrameType::PING, nullptr, 0);
         if (!sendAll(fd, f.data(), f.size())) break;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
 
-    const unsigned long long dropped = server.stats().framesDroppedOnClose.load();
-    const unsigned long long sent    = server.stats().framesSent.load();
-    const unsigned long long aborted = server.stats().aborted.load();
-    std::printf("      framesDroppedOnClose %llu, framesSent %llu, aborted %llu\n",
-                dropped, sent, aborted);
+    const unsigned long long droppedNow = server.stats().framesDroppedOnClose.load();
+    const unsigned long long sentNow    = server.stats().framesSent.load();
+    const unsigned long long aborted    = server.stats().aborted.load();
+    std::printf("      once closing: PINGs dropped +%llu, framesSent %llu -> %llu, "
+                "aborted %llu\n",
+                droppedNow - dropped, sentAfterCloseBegan, sentNow, aborted);
 
-    expect(dropped >= 1, "a PING past the close request is counted as dropped");
-    expect(sent == 0, "and is not answered: no frame left after the close began");
+    expect(dropped >= 1, "a PING reaches a connection that is closing");
+    expect(droppedNow > dropped, "PINGs arriving while closing are counted as dropped");
+    expect(sentNow == sentAfterCloseBegan,
+           "and none of them is answered: no frame leaves after the close began");
     expect(aborted == 0, "the close stayed graceful");
 
     ::close(fd);
