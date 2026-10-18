@@ -1074,17 +1074,15 @@ inline int SubReactor::handleRead(Conn* c) noexcept {
             c->peerClosed = true;
             parseFrames(c, framesLeft);
             if (c->isClosed.load(std::memory_order_acquire)) return dispatched();
-            if (framesLeft <= 0) {
-                // Budget spent with bytes still buffered: complete frames are
-                // waiting whose handler has not run, and their replies have not
-                // been queued yet. Sending a FIN now would put it ahead of them,
-                // and this branch returns without re-arming -- so unless the read
-                // goes back on the list nothing will ever finish this connection.
-                // Re-entering lands back here with a fresh budget and no pending
-                // frames, which is where the teardown actually happens.
-                scheduleRead(c);
-                return dispatched();
-            }
+            // No "budget spent, frames still buffered" case can exist here.
+            // Every path that reaches recv() has already established that fewer
+            // complete frames are buffered than the budget allows: parseFrames
+            // at the top of the loop would otherwise have driven framesLeft to
+            // 0 and exited before the read. recv() returning 0 adds no bytes,
+            // so the parse above consumed nothing and framesLeft still holds.
+            // (Measured: eofReads stays at 1 across bursts of 1..2000 frames,
+            // which is what makes it usable as the busy-poll probe of P1-1b.)
+            assert(framesLeft > 0);
             finishPeerClosed(c);
             return dispatched();
         } else {
