@@ -52,4 +52,38 @@ jobs:
         env:
           ENABLE_ASAN: "1"
           ENABLE_TSAN: "1"
-        run: bash verify/run-in-wsl.sh
+        run: |
+          # pipefail so the tee cannot launder a failing suite into a green job.
+          set -o pipefail
+          bash verify/run-in-wsl.sh 2>&1 | tee /tmp/verify-run.log
+
+      # A [SKIP] is not a pass, and the one worth reading here is hup/err: it
+      # asks the kernel whether EPOLLHUP|EPOLLERR are genuinely delivered, and
+      # every machine this project has been developed on answered no -- an
+      # aborted connection arrives as an ordinary FIN and the case declines to
+      # assert anything. Nothing in the exit code separates "asserted and
+      # passed" from "never ran", and the answer was left buried in a log nobody
+      # opens. Putting it in an annotation means it can be read back off the
+      # checks API without anyone signing into GitHub first.
+      - name: what this kernel was willing to tell us
+        if: always()
+        run: |
+          log=/tmp/verify-run.log
+          if [ ! -f "$log" ]; then
+            echo "::warning title=skipped cases::the suite left no log to read"
+            exit 0
+          fi
+          n=$(grep -c '\[SKIP\]' "$log" || true)
+          echo "::notice title=skipped cases::$n case(s) declined to assert"
+          # The whole hup/err paragraph, up to the blank line that ends it --
+          # taking a fixed number of lines instead drags in the next case's
+          # heading and makes the message look like it says more than it does.
+          verdict=$(awk '/^hup\/err:/{f=1} f && NF==0 {exit} f' "$log" \
+                    | tr '\n' ' ' | tr -s ' ')
+          if [ -z "$verdict" ]; then
+            echo "::warning title=hup/err::no such line in the suite output"
+          elif printf '%s' "$verdict" | grep -q '\[SKIP\]'; then
+            echo "::warning title=hup/err skipped::$verdict"
+          else
+            echo "::notice title=hup/err ran::$verdict"
+          fi
