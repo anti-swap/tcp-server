@@ -324,6 +324,14 @@ struct Conn {
     // finishPeerClosed reuses the same once-guard for the mirror image: a peer
     // that half-closed while its answers were still queued as tasks.
     bool       waitingOnReplies = false;
+    // Input this graceful close still owes the peer: the bytes that were
+    // buffered and unserved when the close was first requested.
+    // drainInputThenClose() may spend queue rounds on them, because handleRead
+    // stops at a fixed per-call budget and one pass cannot be assumed to have
+    // served a whole backlog -- but on nothing beyond them, so a peer that keeps
+    // sending cannot hold the close open with fresh input. Negative means "not
+    // measured yet". Reactor-thread-only.
+    int64_t    closeInputBytes = -1;
     // Peer's FIN has been seen (recv returned 0). Set once, in handleRead;
     // handleWrite consults it to finish a parked close deterministically the
     // moment the drain completes, instead of waiting for a spurious EPOLLIN.
@@ -1497,14 +1505,55 @@ inline void SubReactor::parkClose(Conn* c, const char* reason) noexcept {
 // and parkClose would half-close ahead of them. Resuming one queue round later
 // is what puts the answers in front of the FIN. It resumes at most once: a peer
 // that keeps sending would otherwise hold the close open with more input.
+//
+// "served" is not "the backlog is done". handleRead stops at kFrameBudget frames
+// or kReadBudget bytes per call and reschedules itself for the rest, so a peer
+// that sent more than one budget's worth has input left in rbuf when this
+// returns -- and parking now sets `closing`, which makes submitSend refuse every
+// reply those frames produce. The peer's requests were taken in, handled, and
+// answered into nothing: the exact failure this function exists to prevent,
+// reached through the read budget instead of through queue ordering (measured:
+// 600-frame burst -> 512 answered, 88 dropped; 1200 -> 512 answered).
+//
+// So when input is still buffered this comes back for another round instead of
+// parking. The rounds are bounded by closeInputBytes, measured once, from what
+// was already buffered when the close was asked for: fresh arrivals do not
+// extend it, so a peer that keeps sending cannot hold the close open.
 inline void SubReactor::drainInputThenClose(Conn* c) noexcept {
     if (c->isClosed.load(std::memory_order_acquire) || c->finSent) return;
+
+    // Measured before the read: what had arrived and had not been served yet.
+    if (c->closeInputBytes < 0)
+        c->closeInputBytes = static_cast<int64_t>(c->rbuf.readable());
 
     const int served = handleRead(c);
     // handleRead has its own exits: the peer's FIN may have arrived in the same
     // read, or the socket may have errored. Either way the connection is already
     // accounted for and there is nothing left for this request to do.
     if (c->isClosed.load(std::memory_order_acquire) || c->finSent) return;
+
+    // A dispatched frame is at least a header long, so this under-counts what
+    // was served and over-counts what is left -- the safe direction: the bound
+    // only ever stops the close later than strictly necessary, and never early.
+    if (served > 0)
+        c->closeInputBytes -= static_cast<int64_t>(served) * FRAME_HEADER_SIZE;
+
+    // More of the owed input is still buffered and the budget allows another
+    // round: come back for it. Parking here would refuse the replies of frames
+    // this close promised to serve. Progress is required (served > 0) so a peer
+    // that stops mid-frame cannot keep the close pending on a half a frame.
+    if (served > 0 && !c->rbuf.empty() && c->closeInputBytes > 0) {
+        const uint64_t id = c->id;
+        if (enqueue([this, id]() noexcept {
+                auto it = conns_.find(id);
+                if (it == conns_.end()) return;
+                std::shared_ptr<Conn> keep = it->second;
+                Conn* raw = keep.get();
+                keep.reset();
+                drainInputThenClose(raw);
+            })) return;
+        // The hand-off failed: park below rather than keeping it pending.
+    }
 
     // Nothing further to read, yet bytes are still reserved: replies whose
     // handler already ran -- possibly two batches apart, with this task landing
