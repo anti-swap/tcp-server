@@ -363,6 +363,11 @@ struct Conn {
     // sending cannot hold the close open with fresh input. Negative means "not
     // measured yet". Reactor-thread-only.
     int64_t    closeInputBytes = -1;
+    // Bytes this connection's handleRead() has taken off the socket since
+    // drainInputThenClose() zeroed it, which is always either nobody or the
+    // graceful close: it is how a round can be charged for input that arrived
+    // *during* the round. Reactor-thread-only, like closeInputBytes.
+    size_t     drainReadBytes = 0;
     // Peer's FIN has been seen (recv returned 0). Set once, in handleRead;
     // handleWrite consults it to finish a parked close deterministically the
     // moment the drain completes, instead of waiting for a spurious EPOLLIN.
@@ -1233,6 +1238,11 @@ inline int SubReactor::handleRead(Conn* c) noexcept {
         if (n > 0) {
             c->rbuf.write(tmp, static_cast<size_t>(n));
             bytesLeft -= static_cast<int>(n);
+            // Only ever read by drainInputThenClose(), which zeroes it first:
+            // it has to know how much of what this call served was input that
+            // arrived during the call, because a frame that rides in on the same
+            // read as the backlog must be charged to the close budget too.
+            c->drainReadBytes += static_cast<size_t>(n);
             // Stamped here, on arrival, rather than only when the bytes complete
             // a frame: with the stamp in parseFrames alone, a frame that took
             // longer than idleTimeoutMs to arrive was closed while it was still
@@ -1711,17 +1721,39 @@ inline void SubReactor::drainInputThenClose(Conn* c) noexcept {
     if (c->closeInputBytes < 0)
         c->closeInputBytes = static_cast<int64_t>(c->rbuf.readable());
 
+    c->drainReadBytes = 0;
+    const size_t queuedBefore = c->rbuf.readable();
     const int served = handleRead(c);
     // handleRead has its own exits: the peer's FIN may have arrived in the same
     // read, or the socket may have errored. Either way the connection is already
     // accounted for and there is nothing left for this request to do.
     if (c->isClosed.load(std::memory_order_acquire) || c->finSent) return;
 
-    // A dispatched frame is at least a header long, so this under-counts what
-    // was served and over-counts what is left -- the safe direction: the bound
-    // only ever stops the close later than strictly necessary, and never early.
-    if (served > 0)
-        c->closeInputBytes -= static_cast<int64_t>(served) * FRAME_HEADER_SIZE;
+    // Charged in bytes, and for every byte the call handed out -- including the
+    // ones that arrived during it. Charging `served * FRAME_HEADER_SIZE` made
+    // this a frame counter that every frame paid the same flat eight bytes for
+    // whatever it carried, so the credit was really "backlog / 8 frames", each
+    // of which may be MAX_FRAME_PAYLOAD wide: a read buffer holding 1.7 KiB let
+    // a peer that kept talking be served 13.7 MiB and 210 frames after the
+    // application had asked to hang up. Nothing bounded it either -- the close
+    // had not parked, so no linger deadline existed yet, and every arrival
+    // refreshed the idle clock.
+    //
+    // Charging net of what is still buffered is not enough either: a peer that
+    // keeps the pipe full has its bytes consumed by the same read that fetched
+    // them, so "what is left in rbuf" barely moves however much it sends. Bytes
+    // served = what was buffered, plus what this call read, minus what is still
+    // there, and that is FIFO: the backlog is charged off the head first, and
+    // everything the peer adds afterwards is charged against whatever is left of
+    // it. What survives past that is at most one read budget of the newest input,
+    // bounded by kReadBudget and independent of how much the peer sends.
+    if (served > 0) {
+        const int64_t dealt = static_cast<int64_t>(queuedBefore)
+                            + static_cast<int64_t>(c->drainReadBytes)
+                            - static_cast<int64_t>(c->rbuf.readable());
+        if (dealt > 0) c->closeInputBytes -= dealt;
+        c->drainReadBytes = 0;
+    }
 
     // More of the owed input is still buffered and the budget allows another
     // round: come back for it. Parking here would refuse the replies of frames
