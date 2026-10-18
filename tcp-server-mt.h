@@ -263,14 +263,20 @@ class SubReactor;
 
 // One reservation follows a socket from the accept queue through connection
 // lifetime. Every failure/discard path releases it through the same destructor.
+// The RMWs are relaxed, same policy as every other gauge: RMW cannot lose an
+// update, nothing non-atomic is published through the count, and the accept
+// loop's cap check is advisory by nature (the load races the reservation by
+// definition). The ++/-- operator forms would quietly mean seq_cst.
 struct Admission {
     std::atomic<size_t>& count;
-    explicit Admission(std::atomic<size_t>& value) noexcept : count(value) { ++count; }
+    explicit Admission(std::atomic<size_t>& value) noexcept : count(value) {
+        count.fetch_add(1, std::memory_order_relaxed);
+    }
     Admission(const Admission&) = delete;
     Admission& operator=(const Admission&) = delete;
     Admission(Admission&&) = delete;
     Admission& operator=(Admission&&) = delete;
-    ~Admission() { --count; }
+    ~Admission() { count.fetch_sub(1, std::memory_order_relaxed); }
 };
 
 // ==================== 连接 ====================
@@ -1275,7 +1281,7 @@ inline void SubReactor::parseFrames(Conn* c, int& framesLeft) noexcept {
             // 幂等的目标状态迁移；不用 "wasEmpty" 判断（见 submitSend 注释）
             armWrite(c);
             // closeConn 只标记 + 摘除，不再在栈内跑回调；但可能已因 arm 失败关闭
-            if (c->isClosed.load()) return;
+            if (c->isClosed.load(std::memory_order_acquire)) return;
             c->rbuf.consume(len);
         } else if (type == FrameType::PONG) {
             c->rbuf.consume(len);
