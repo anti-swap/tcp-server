@@ -178,6 +178,18 @@ class RingBuffer {
         return r;
     }
 
+    // Same as peek, but starting `skip` bytes into the readable region. The
+    // send path uses it to read a frame header that is not at the head.
+    size_t peekAt(size_t skip, uint8_t* p, size_t n) const noexcept {
+        if (skip >= size_) return 0;
+        size_t r = std::min(n, size_ - skip);
+        size_t at = (head_ + skip) % cap_;
+        size_t first = std::min(r, cap_ - at);
+        std::memcpy(p, buf_.data() + at, first);
+        if (r > first) std::memcpy(p + first, buf_.data(), r - first);
+        return r;
+    }
+
     void consume(size_t n) noexcept {
         size_t r = std::min(n, size_);
         if (r == 0) return;    // also covers the uninitialised cap_ == 0 case
@@ -218,6 +230,9 @@ struct ServerStats {
     std::atomic<uint64_t> rejected{0};
     std::atomic<uint64_t> closed{0};
     std::atomic<uint64_t> framesRecv{0};
+    // 帧的最后一个字节到达内核时才计（drainWbufToSocket），与 bytesSent 同一
+    // 计量点。若在"进 wbuf"时计，abort 丢掉的帧会永久留在计数里且无处扣减
+    // （实测一次 abort：计了 511 帧、实际送达 48 帧）。
     std::atomic<uint64_t> framesSent{0};
     std::atomic<uint64_t> bytesRecv{0};
     std::atomic<uint64_t> bytesSent{0};
@@ -284,6 +299,12 @@ struct Conn {
     // epoll_ctl calls, so a stale EPOLLOUT event cannot tear down a live write
     // interest (and a queued frame cannot be stranded without a wakeup).
     bool       writeArmed = false;
+    // Bytes of the frame at the head of wbuf that have not reached the kernel.
+    // wbuf only ever receives whole frames, so the head is either inside
+    // exactly one frame or exactly at a frame boundary; this field says which,
+    // so the drain can count a frame when its last byte leaves instead of when
+    // it is queued. Reactor-thread-only, like wbuf itself.
+    size_t      sendFrameRemain = 0;
     // -------- close protocol --------
     // closing: a graceful close has been requested and is being honoured (output
     //          drained, FIN sent or imminent). Submissions are refused from here
@@ -877,7 +898,8 @@ inline bool SubReactor::submitSend(uint64_t id,
             // arm 无副作用；而 wbuf.empty() 看不到 pendingBytes 里"已占额、尚未
             // 写入"的那部分，用它决定是否 arm 会在与 disarmWrite 交错时漏掉真正的
             // 写兴趣，导致已入 wbuf 的帧无限滞留。
-            server_->statsRef().framesSent.fetch_add(1, std::memory_order_relaxed);
+            // framesSent 不在这里计：帧在离开 wbuf 进内核时才计（见
+            // drainWbufToSocket），与 bytesSent 同一计量点。
             armWrite(c);
         };
     } catch (...) {
@@ -978,6 +1000,37 @@ inline int SubReactor::drainWbufToSocket(Conn* c) noexcept {
             return -1;
         }
         if (k == 0) return -1;
+        // Frame accounting runs before consume(): the readable region still
+        // holds the bytes that just left, so a frame starting inside this
+        // chunk still has its header there to read. A frame is counted when
+        // its last byte reaches the kernel -- the same boundary bytesSent
+        // counts at, which is what keeps the two reconcilable. Counting on
+        // queueing instead meant an abort could drop frames the counter had
+        // already claimed, with nothing left to subtract them from.
+        {
+            size_t off  = 0;   // where the current frame starts, from the head
+            size_t left = static_cast<size_t>(k);
+            while (left > 0) {
+                if (c->sendFrameRemain == 0) {
+                    // Whole frames only ever enter wbuf, so a boundary inside
+                    // the readable region always has a full header behind it.
+                    uint8_t hdr[FRAME_HEADER_SIZE];
+                    c->wbuf.peekAt(off, hdr, FRAME_HEADER_SIZE);
+                    const uint32_t flen = (static_cast<uint32_t>(hdr[4]) << 24)
+                                        | (static_cast<uint32_t>(hdr[5]) << 16)
+                                        | (static_cast<uint32_t>(hdr[6]) <<  8)
+                                        |  static_cast<uint32_t>(hdr[7]);
+                    c->sendFrameRemain = FRAME_HEADER_SIZE + flen;
+                }
+                const size_t take = std::min(left, c->sendFrameRemain);
+                c->sendFrameRemain -= take;
+                left -= take;
+                off += take;
+                if (c->sendFrameRemain == 0)
+                    server_->statsRef().framesSent.fetch_add(1,
+                                                              std::memory_order_relaxed);
+            }
+        }
         c->wbuf.consume(static_cast<size_t>(k));
         budget -= static_cast<size_t>(k);
         c->pendingBytes.fetch_sub(static_cast<size_t>(k), std::memory_order_relaxed);
@@ -1229,7 +1282,7 @@ inline void SubReactor::parseFrames(Conn* c, int& framesLeft) noexcept {
                 continue;
             }
             c->wbuf.write(pong.data(), pong.size());
-            server_->statsRef().framesSent.fetch_add(1, std::memory_order_relaxed);
+            // framesSent 同样在离开 wbuf 时计（见 submitSend 的说明）。
             // 幂等的目标状态迁移；不用 "wasEmpty" 判断（见 submitSend 注释）
             armWrite(c);
             // closeConn 只标记 + 摘除，不再在栈内跑回调；但可能已因 arm 失败关闭
@@ -1293,6 +1346,8 @@ inline void SubReactor::discardPendingOutput(Conn* c) noexcept {
     const size_t remaining = c->wbuf.readable();
     if (remaining == 0) return;
     c->wbuf.clear();
+    // The in-flight frame boundary dies with the buffer.
+    c->sendFrameRemain = 0;
     c->pendingBytes.fetch_sub(remaining, std::memory_order_relaxed);
     server_->statsRef().bytesDropped.fetch_add(remaining, std::memory_order_relaxed);
 }
