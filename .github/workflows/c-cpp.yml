@@ -1,23 +1,55 @@
-name: C/C++ CI
+# What this job can claim, and what it cannot.
+#
+# verify/run-in-wsl.sh is the real gate: seven suites compiled and run under
+# plain, asan+ubsan and tsan, plus cpplint on the header. All of it is Linux
+# work, so an ubuntu-latest runner covers the interesting half of the project.
+#
+# verify/build.sh is deliberately absent. It type-checks the header against a
+# hand-written POSIX shim on Windows -- that check exists because this desk
+# cannot produce a real Linux binary, not because Linux lacks anything, and the
+# compile below already carries the same warning set. Putting a Windows runner
+# behind it would mainly buy new ways to fail for MSYS reasons.
+#
+# One thing this job does that no local run has managed: GitHub's runner has a
+# real kernel. send_results' hup/err case asks the host whether EPOLLHUP|EPOLLERR
+# are actually delivered and prints [SKIP] when they are not. On WSL they are
+# not -- an aborted connection arrives as an ordinary FIN -- so that case has sat
+# unexecuted through three review rounds. Here it should run.
+name: verify
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ main ]
   pull_request:
-    branches: [ "main" ]
+    branches: [ main ]
 
 jobs:
-  build:
-
+  linux:
     runs-on: ubuntu-latest
+    # 21 runs of 7 suites. Each one has a 180s timeout inside the script, so a
+    # hung case presents as a failure rather than as an idle job.
+    timeout-minutes: 60
 
     steps:
-    - uses: actions/checkout@v4
-    - name: configure
-      run: ./configure
-    - name: make
-      run: make
-    - name: make check
-      run: make check
-    - name: make distcheck
-      run: make distcheck
+      - uses: actions/checkout@v4
+
+      # The script installs build-essential itself if g++ is missing; doing it
+      # here keeps that branch from ever being taken, and hides its apt chatter.
+      - name: toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential python3-pip
+
+      - name: cpplint
+        # Ubuntu marks its system python externally-managed, so the plain
+        # install is refused. The fallback is for images that predate that.
+        run: |
+          python3 -m pip install --break-system-packages -q cpplint ||
+            python3 -m pip install -q cpplint
+          python3 -m cpplint --version
+
+      - name: seven suites under plain, asan+ubsan and tsan
+        env:
+          ENABLE_ASAN: "1"
+          ENABLE_TSAN: "1"
+        run: bash verify/run-in-wsl.sh
