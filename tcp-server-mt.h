@@ -48,16 +48,6 @@ constexpr uint16_t FRAME_MAGIC       = 0xEB90;
 constexpr size_t   FRAME_HEADER_SIZE = 8;
 constexpr uint32_t MAX_FRAME_PAYLOAD = 64 * 1024;
 
-// How long a peer may linger in TIME_WAIT holding a descriptor of ours. Without
-// it the kernel keeps the peer's address (and our fd slot) for 60s after we
-// close first, which is enough to exhaust a low RLIMIT_NOFILE under churn. This
-// affects the state's lifetime only, never whether the close itself is an
-// orderly FIN or an RST -- SO_LINGER decides that, and we never set it except on
-// the explicit abort path.
-#ifndef INDUSTRIAL_TCP_LINGER_S
-#define INDUSTRIAL_TCP_LINGER_S 1
-#endif
-
 enum class FrameType : uint16_t {
     DATA = 0x0001,
     PING = 0x0002,
