@@ -71,12 +71,22 @@ either layout -- before or after the directory move on 2026-10-18.
 ## Still open
 
 Three rounds (the sixth, the seventh and the eighth) each closed carrying the
-same few items they could not settle themselves. They are listed here because
-they were never disproved, only never executed locally:
+same few items they could not settle themselves. They were never disproved; they
+were only never executed locally. The first of them now has been:
 
-- **Coverage of `EPOLLHUP` / `EPOLLERR` on a real kernel**: the case is written,
-  but the WSL kernel here does not deliver those two events, so it always prints
-  `[SKIP]`. On a real Linux kernel it starts running by itself.
+- **`EPOLLHUP` / `EPOLLERR` -- closed, 2026-10-18, on a real kernel.** This case
+  printed `[SKIP]` on every machine here, because those kernels hand an aborted
+  connection over as an ordinary FIN and the events never arrive; asserting
+  against a break the host cannot produce would be asserting against the host.
+  CI put it somewhere that can: on the runner, `send_results` reports hup/err as
+  having run and asserted under plain, asan+ubsan and tsan alike, with no other
+  case in the suite declining. The verdict comes back as an annotation filed by
+  the step named "what this kernel was willing to tell us", not as an exit code,
+  because a `[SKIP]` leaves the exit code alone: nothing else in the output
+  separates "asserted and passed" from "never ran".
+
+Two remain open:
+
 - **Measured behaviour with several reactors**: the conclusions that depend on
   reactor count were only ever run with `numReactors = 1`. More reactors does not
   change the control flow of those functions -- they run only on the owning
