@@ -907,8 +907,6 @@ inline bool SubReactor::submitClose(uint64_t id) noexcept {
             if (it != conns_.end()) {
                 // Copy out and reset the map handle before closing: the deferred
                 // close callbacks must not run while this frame holds the conn.
-                // Default (graceful): this is an application-level "we are done",
-                // so the reply queued just before it must still reach the peer.
                 std::shared_ptr<Conn> c = it->second;
                 Conn* raw = c.get();
                 c.reset();
