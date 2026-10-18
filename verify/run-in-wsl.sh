@@ -54,6 +54,7 @@ build() {
     g++ "${base_flags[@]}" "$@" verify/close_semantics.cpp -o /tmp/close_semantics
     g++ "${base_flags[@]}" "$@" verify/idle_semantics.cpp -o /tmp/idle_semantics
     g++ "${base_flags[@]}" "$@" verify/ping_pong.cpp -o /tmp/ping_pong
+    g++ "${base_flags[@]}" "$@" verify/send_results.cpp -o /tmp/send_results
     g++ "${base_flags[@]}" "$@" verify/backpressure.cpp -o /tmp/backpressure
     g++ "${base_flags[@]}" "$@" -DINDUSTRIAL_TCP_TESTING verify/fault_injection.cpp \
         -o /tmp/fault_injection
@@ -68,6 +69,7 @@ run_all() {
                    "close_semantics, CS_REACTORS=1:env CS_REACTORS=1 /tmp/close_semantics" \
                    "idle_semantics:/tmp/idle_semantics" \
                    "ping_pong:/tmp/ping_pong" \
+                   "send_results:/tmp/send_results" \
                    "backpressure:/tmp/backpressure" \
                    "fault_injection:/tmp/fault_injection"; do
         local name="${attempt%%:*}"
@@ -179,8 +181,18 @@ cat <<EOF
     close. It asserts the PONG is counted (bytesSent == 8 per PONG, the header
     size) and that one past a close request is dropped rather than answered
     over the FIN.
+  - send_results asks what sendTo() can say back: one assertion per SendResult
+    value, because four of the five had none anywhere in the suite and a correct
+    unguarded branch is free to change. Overloaded is reached by a frame larger
+    than a 32-byte ceiling rather than by racing the drain. It also counts
+    acceptErrors in a forked child whose descriptor ceiling is below the number
+    of peers knocking -- the one accept failure that is predictable at startup
+    and leaves no other symptom.
   - A [SKIP] line is a case that asked the machine a question first and did not
-    like the answer. It names what it checked. It is not a pass.
+    like the answer. It names what it checked. It is not a pass. send_results'
+    hup/err case is one of these on hosts that report an aborted connection as
+    an ordinary FIN (WSL's 4.4 kernel does): EPOLLHUP|EPOLLERR is then never
+    delivered, so the branch cannot be reached from there.
   - This run says nothing about verify/build.sh: that check is Windows-side only
     and has to be run separately, from a Windows shell.
 

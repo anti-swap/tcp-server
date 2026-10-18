@@ -129,6 +129,31 @@ g++ -std=c++17 -Wall -Wextra -pthread -DINDUSTRIAL_TCP_TESTING \
 
 8192 一帧不差 —— 卡住的位置正好是那条常量。它是故意先红着提交的（`f8a6523`）。
 
+## `send_results.cpp` —— sendTo 的五种回答，外加两个计数器
+
+`sendTo()` 是应用往连接上放字节的唯一入口，`SendResult` 是它能拿回的全部信息。但第六轮之前，
+四个失败态（`NotConnected` / `TooLarge` / `Overloaded` / `InvalidArgument`）**整个 verify/ 里没有任何
+一条断言碰过**。"正确但无人守护"是最糟的一种状态：任何一次编辑都能改掉它，而所有配置仍然全绿。
+
+覆盖的三件事：
+
+| 用例 | 断言 |
+|------|------|
+| 五种回答 | 每个值各一条，且都落在真正产生它的状态上；`Overloaded` 用"帧大于 32 字节上限"达成，不去和排空赛跑 |
+| 关闭中发送 | `Closed`，且不留 `queueDrops` / `bytesDropped`（R6-3） |
+| `acceptErrors` | 子进程把 `RLIMIT_NOFILE` 的**硬**限制压到 20，父进程连 40 个peer 撑爆它；拒绝的 accept 必须被计数 |
+
+`acceptErrors` 那条必须 fork：描述符上限是**每进程**的，得让"耗尽的一方"和"不停敲门的一方"是两个进程。
+压的是硬限制而不是软限制——`start()` 会把软限制往硬限制抬，抬得上去的 ceiling 不是 ceiling。
+
+`hup/err` 分支（`EPOLLHUP|EPOLLERR` → `closeConn(c, "hup/err", false)`）同样补了用例，但它是
+**先问后测**：先用一对裸 socket 问内核"被中止的连接在 epoll 上是否可见"。本机（WSL1，4.4.0）
+把它报成干净 FIN，`EPOLLHUP|EPOLLERR` 永远不会被投递，于是该分支在这里**无法到达**，用例打印
+`[SKIP]` 并说明它问了什么。**跳过不等于通过**；换到真内核上那条断言自动生效。
+
+这与 C 用例的 `kernelHonoursZeroLinger()` 是同一个规矩：先确定机器能不能造出这个状态，
+再决定断言还是跳过。不这么做的话，断言的对象就从头文件变成了宿主机。
+
 ## 七种假阴性（按发现顺序）
 
 > 更新：现在是八种。第 8 条是关于 **cpplint 的退出码** —— 见本节末尾。
