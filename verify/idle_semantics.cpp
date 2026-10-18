@@ -233,6 +233,65 @@ void caseFullFrames() {
     server.stop();
 }
 
+// The consequence of A, and the question its fix leaves open: if a peer inside
+// a frame is no longer idle-reclaimed, what reclaims it?
+//
+// Answer, measured rather than assumed: the same clock, the moment the peer
+// actually stops. A frame it never finishes cannot grow without bound -- the
+// header's length is capped at MAX_FRAME_PAYLOAD (a larger one is closed as
+// "frame too large" on arrival) and rbuf is required to hold the largest legal
+// frame, so "rbuf full with an incomplete frame" is unreachable under start()'s
+// validation. A peer can stall inside a frame for as long as it keeps sending;
+// the instant it stops, it is a silent peer again.
+//
+// So: send a legal maximum frame all but one byte of it, then stop talking.
+void caseHalfFrameThenSilent() {
+    std::printf("D. half-frame that stops mid-frame: is it reclaimed then?\n");
+    MultiReactorServer::Config cfg = idleConfig();
+    MultiReactorServer server(cfg);
+    server.setMessageHandler([](uint64_t, const uint8_t*, size_t) {});
+    if (!server.start()) { expect(false, "start() ok"); return; }
+
+    int fd = connectTo(cfg.port);
+    if (fd < 0) { expect(false, "client connected"); server.stop(); return; }
+
+    const size_t kChunk = 2000;
+    const size_t kTotal = industrial::MAX_FRAME_PAYLOAD;
+    uint8_t hdr[industrial::FRAME_HEADER_SIZE];
+    industrial::writeFrameHeader(hdr, FrameType::DATA, kTotal);
+    if (!sendAll(fd, hdr, sizeof(hdr))) { expect(false, "header sent"); ::close(fd); server.stop(); return; }
+
+    // All but the last byte, delivered fast enough that the clock never expires
+    // while the peer is still active.
+    size_t sent = 0;
+    while (sent + kChunk < kTotal) {
+        std::vector<uint8_t> body(kChunk, 'x');
+        if (!sendAll(fd, body.data(), body.size())) break;
+        sent += kChunk;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    const unsigned long long idleWhileSending = server.stats().idleTimeouts.load();
+
+    // Now silent, inside a frame, for well past the deadline.
+    bool fin = false;
+    for (int i = 0; i < 150 && !fin; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        fin = hungUp(fd);
+    }
+
+    const unsigned long long idle = server.stats().idleTimeouts.load();
+    std::printf("      sent %zu of %zu bytes, then stopped; idleTimeouts %llu "
+                "(was %llu while sending), FIN'd: %s\n",
+                sent, kTotal, idle, idleWhileSending, fin ? "yes" : "no");
+
+    expect(idleWhileSending == 0, "still not reclaimed while it was sending");
+    expect(fin, "reclaimed once it went silent, even mid-frame");
+    expect(idle >= 1, "by the idle clock, which is the only thing that changed");
+
+    ::close(fd);
+    server.stop();
+}
+
 }  // namespace
 
 int main() {
@@ -242,6 +301,7 @@ int main() {
     caseHalfFrame();
     caseSilent();
     caseFullFrames();
+    caseHalfFrameThenSilent();
     std::printf("\n%s (%d failure%s)\n", gFailures == 0 ? "ALL PASS" : "FAILURES",
                 gFailures, gFailures == 1 ? "" : "s");
     return gFailures == 0 ? 0 : 1;
