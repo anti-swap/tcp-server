@@ -199,3 +199,32 @@ Ubuntu 的 g++ 11.4）的 ThreadSanitizer 会对此报 **double lock of a mutex*
 - 不模拟 `errno` 语义，所以依赖错误码分支的逻辑只能靠 review
 
 它**不是**兼容层，不要试图用它跑程序。
+
+## 一个概率型缺陷怎么测：case F 与插桩工具
+
+`close_semantics` 的 F 用例（20 轮"一知道请求到了就关"）针对的窗口只有几微秒：请求已被处理，
+但它产生的应答任务还没执行，此时 close 落进来会马上 park，跟在它后面的应答任务被 `closing`
+拒绝。单次跑几乎必过——跑一遍看到 `0 of 20` 不代表没问题。
+
+因此：
+
+- **评估只能看复现率**：`bash verify/evidence/loop_close_race.sh 8 <修复前的 ref>`，
+  两份构建各跑 N 遍 TSan 并统计。本机实测修复前 4/8 复现、修复后 0/8。
+- **定位靠插桩不靠猜**：`python3 verify/evidence/trace_close_race.py <in> <out>` 给 header
+  **副本**打上决策点日志（`SUBMIT_SEND` / `SUBMIT_CLOSE` / `TASK_SEND` / `PARK_IMMEDIATE`
+  / `PARK_DEFER` / `REFUSE`），出错那轮的顺序是一条 reading-list：
+
+```
+[t] SUBMIT_SEND id=22     handler 排入应答 A
+[t] SUBMIT_CLOSE id=22    应用的关闭插在 A 与 B 之间
+[t] SUBMIT_SEND id=22     handler 排入应答 B
+[t] TASK_SEND id=22       A 执行 → 放行
+[t] PARK_IMMEDIATE id=22  关闭任务发现已无可读 → 立刻 park
+[t] TASK_SEND id=22 → REFUSE  B 撞上 closing
+```
+
+前三个假设都是错的，trace 一行就给出答案。**但注意 tracing 会改变被测窗口的时序**，所以
+A/B 对照必须用两份都未插桩的构建——`loop_close_race.sh` 就是这么做的。
+
+可复用判据：判断"这条连接还欠字节吗"要看 `pendingBytes > 0`（已占额度、还没进 wbuf），
+而不是 `wbuf.empty()`。handler 的应答是 `submitSend` 排的任务，从不直写 wbuf。
