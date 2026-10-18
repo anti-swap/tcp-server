@@ -53,6 +53,7 @@ build() {
     echo "== building [$label] =="
     g++ "${base_flags[@]}" "$@" verify/close_semantics.cpp -o /tmp/close_semantics
     g++ "${base_flags[@]}" "$@" verify/idle_semantics.cpp -o /tmp/idle_semantics
+    g++ "${base_flags[@]}" "$@" verify/ping_pong.cpp -o /tmp/ping_pong
     g++ "${base_flags[@]}" "$@" verify/backpressure.cpp -o /tmp/backpressure
     g++ "${base_flags[@]}" "$@" -DINDUSTRIAL_TCP_TESTING verify/fault_injection.cpp \
         -o /tmp/fault_injection
@@ -66,6 +67,7 @@ run_all() {
     for attempt in "close_semantics, default reactors:/tmp/close_semantics" \
                    "close_semantics, CS_REACTORS=1:env CS_REACTORS=1 /tmp/close_semantics" \
                    "idle_semantics:/tmp/idle_semantics" \
+                   "ping_pong:/tmp/ping_pong" \
                    "backpressure:/tmp/backpressure" \
                    "fault_injection:/tmp/fault_injection"; do
         local name="${attempt%%:*}"
@@ -172,6 +174,11 @@ cat <<EOF
     silent, one sending complete frames. Only the middle one may be closed. A
     failure in the first case with the other two still passing is the clock
     measuring frames instead of bytes.
+  - ping_pong covers the read path's most conditional branch, which no case had
+    executed at all: PING on a healthy connection, and PING in flight with a
+    close. It asserts the PONG is counted (bytesSent == 8 per PONG, the header
+    size) and that one past a close request is dropped rather than answered
+    over the FIN.
   - A [SKIP] line is a case that asked the machine a question first and did not
     like the answer. It names what it checked. It is not a pass.
   - This run says nothing about verify/build.sh: that check is Windows-side only
