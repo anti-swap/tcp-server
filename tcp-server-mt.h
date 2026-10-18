@@ -337,12 +337,24 @@ struct Conn {
     // the owner has already decided not to do.
     std::atomic<bool> closing{false};
     bool       finSent = false;
-    // A graceful close whose final read dispatched requests: their replies are
-    // still queued, and the FIN waits for them. Bounds the wait to one round --
-    // a peer that keeps sending cannot hold the close open with more input.
-    // finishPeerClosed reuses the same once-guard for the mirror image: a peer
-    // that half-closed while its answers were still queued as tasks.
-    bool       waitingOnReplies = false;
+    // A graceful close whose final read dispatched requests still has their
+    // replies queued, and the FIN waits for them. At most one queue round may
+    // be spent waiting -- a peer that keeps sending cannot hold the close open
+    // with more input -- and the round has an owner, because only the side that
+    // deferred knows what the wait was for:
+    //
+    //   Close      -- drainInputThenClose() deferred; the round ends in a park.
+    //   PeerClosed -- finishPeerClosed() deferred; the round ends in whatever
+    //                 finishPeerClosed() decides once the replies have landed
+    //                 in wbuf -- a FIN, or "nothing left, close now".
+    //
+    // One bool cannot say which, and conflating them cost the peer its last
+    // answer: taken as "the round has been spent, park now" rather than "the
+    // round is still owed", it parked the close one round early, with wbuf
+    // still empty and the FIN therefore immediate -- over replies whose own
+    // deferral had not run yet.
+    enum class DeferredRound : uint8_t { None = 0, Close, PeerClosed };
+    DeferredRound deferredRound = DeferredRound::None;
     // Input this graceful close still owes the peer: the bytes that were
     // buffered and unserved when the close was first requested.
     // drainInputThenClose() may spend queue rounds on them, because handleRead
@@ -1339,7 +1351,7 @@ inline bool SubReactor::tryBeginWriteShutdown(Conn* c) noexcept {
 //      registered is not a park -- the branch below ends the connection instead,
 //      because the only thing a half-registered park can do is spin.
 //   2. wbuf empty but pendingBytes > 0 -- replies are queued behind this batch.
-//      Defer exactly one queue round (waitingOnReplies) so they land in wbuf
+//      Defer exactly one queue round (deferredRound = PeerClosed) so they land in wbuf
 //      first; FIFO runs every task queued before this one first. At most once:
 //      a producer racing the close must not hold the connection open forever.
 //   3. nothing outstanding  -- FIN (if we are closing) and tear down now.
@@ -1397,9 +1409,10 @@ inline void SubReactor::finishPeerClosed(Conn* c) noexcept {
         // so that adding one cannot turn into a blind epoll_ctl on fd -1.
         return;                    // parked close finishes in handleWrite
     }
-    if (!c->closing.load(std::memory_order_acquire) && !c->waitingOnReplies &&
+    if (!c->closing.load(std::memory_order_acquire) &&
+        c->deferredRound == Conn::DeferredRound::None &&
         c->pendingBytes.load(std::memory_order_relaxed) > 0) {
-        c->waitingOnReplies = true;
+        c->deferredRound = Conn::DeferredRound::PeerClosed;
         const uint64_t id = c->id;
         if (enqueue([this, id]() noexcept {
                 auto it = conns_.find(id);
@@ -1733,9 +1746,9 @@ inline void SubReactor::drainInputThenClose(Conn* c) noexcept {
     // which submitSend refuses, and the peer gets an orderly FIN over a request
     // we took in, handled, and answered into nothing (case F: 11 of 22 bytes).
     // Their reservations still standing is what makes them visible here.
-    if (served == 0 && !c->waitingOnReplies &&
+    if (served == 0 && c->deferredRound == Conn::DeferredRound::None &&
         c->pendingBytes.load(std::memory_order_relaxed) > 0) {
-        c->waitingOnReplies = true;
+        c->deferredRound = Conn::DeferredRound::Close;
         const uint64_t id = c->id;
         if (enqueue([this, id]() noexcept {
                 auto it = conns_.find(id);
@@ -1747,12 +1760,21 @@ inline void SubReactor::drainInputThenClose(Conn* c) noexcept {
             })) return;
         // The hand-off failed: park here rather than keeping it forever.
     }
-    if (served == 0 || c->waitingOnReplies) {
+    // The peer's FIN arrived in the same read that dispatched these frames, and
+    // finishPeerClosed() already claimed the round: it is queued to come back
+    // once the replies have landed in wbuf. Parking here would set `closing`
+    // and -- wbuf still being empty -- send the FIN at once, over the very
+    // replies that deferral exists to protect. The close ends in the task that
+    // owns the round, which is also the only one that can see whether anything
+    // is still owed.
+    if (c->deferredRound == Conn::DeferredRound::PeerClosed) return;
+
+    if (served == 0 || c->deferredRound == Conn::DeferredRound::Close) {
         parkClose(c, "requested");
         return;
     }
 
-    c->waitingOnReplies = true;
+    c->deferredRound = Conn::DeferredRound::Close;
     const uint64_t id = c->id;
     if (enqueue([this, id]() noexcept {
             auto it = conns_.find(id);
