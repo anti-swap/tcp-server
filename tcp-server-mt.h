@@ -1389,6 +1389,26 @@ inline void SubReactor::drainInputThenClose(Conn* c) noexcept {
     // accounted for and there is nothing left for this request to do.
     if (c->isClosed.load(std::memory_order_acquire) || c->finSent) return;
 
+    // Nothing further to read, yet bytes are still reserved: replies whose
+    // handler already ran -- possibly two batches apart, with this task landing
+    // between them. Parking now side-effects every one of them into `closing`,
+    // which submitSend refuses, and the peer gets an orderly FIN over a request
+    // we took in, handled, and answered into nothing (case F: 11 of 22 bytes).
+    // Their reservations still standing is what makes them visible here.
+    if (served == 0 && !c->waitingOnReplies &&
+        c->pendingBytes.load(std::memory_order_relaxed) > 0) {
+        c->waitingOnReplies = true;
+        const uint64_t id = c->id;
+        if (enqueue([this, id]() noexcept {
+                auto it = conns_.find(id);
+                if (it == conns_.end()) return;
+                std::shared_ptr<Conn> keep = it->second;
+                Conn* raw = keep.get();
+                keep.reset();
+                parkClose(raw, "requested");
+            })) return;
+        // The hand-off failed: park here rather than keeping it forever.
+    }
     if (served == 0 || c->waitingOnReplies) {
         parkClose(c, "requested");
         return;
