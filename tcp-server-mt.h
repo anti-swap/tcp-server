@@ -1582,7 +1582,26 @@ inline void SubReactor::doTick() noexcept {
     const int64_t now   = nowMs();
     const int64_t cutoff = now - server_->idleTimeoutMs();
     const int64_t linger = server_->closeLingerMs();
-    std::vector<std::shared_ptr<Conn>> expired;
+    // Every due close is collected during the walk and performed after it,
+    // because closeConn is not always content to park the connection. Three
+    // ways in reach from a single call all erase from conns_ -- the map this
+    // range-for is holding an iterator into:
+    //   - a connection that has already sent its FIN goes straight to
+    //     teardownClosed (parkClose returns early on finSent);
+    //   - parkClose's own drain may fail (a peer that vanished and RST'd) and
+    //     takes the same teardown;
+    //   - armWrite/disarmWrite abort the connection if epoll_ctl fails.
+    // None of them is reachable from the sweep today on purpose; all of them
+    // are reachable by accident. Moving the closes out of the loop makes the
+    // question moot instead of documented, which is stronger than the assert
+    // that would otherwise stand in for it -- an assert is compiled out under
+    // NDEBUG, leaving production with nothing.
+    //
+    // The connections are carried as shared_ptr: erase detaches them from
+    // conns_ between being chosen and being closed, and nothing else holds a
+    // reference across that gap.
+    std::vector<std::shared_ptr<Conn>> idle;      // graceful: may still owe bytes
+    std::vector<std::shared_ptr<Conn>> expired;   // past its deadline: forced
     for (auto& kv : conns_) {
         Conn* c = kv.second.get();
         if (c->closing) {
@@ -1601,11 +1620,10 @@ inline void SubReactor::doTick() noexcept {
             // Default (graceful): an idle connection is still a legitimate peer
             // and may hold a half-finished exchange, so let the close park until
             // what we owe it is out.
-            closeConn(c, "idle timeout");
+            idle.push_back(kv.second);
         }
     }
-    // Forced close of parked connections happens after the sweep: closeConn
-    // erases from conns_, which would invalidate the iterator above.
+    for (auto& c : idle)    closeConn(c.get(), "idle timeout");
     for (auto& c : expired) closeConn(c.get(), "close linger expired", false);
 }
 
