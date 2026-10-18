@@ -701,7 +701,8 @@ inline void SubReactor::cleanup() noexcept {
     // Discard waiting tasks; shared FdGuard captures close unclaimed sockets.
     {
         std::lock_guard<std::mutex> lk(pendingMutex_);
-        server_->statsRef().pendingTasksDepth.fetch_sub(pendingTasks_.size());
+        server_->statsRef().pendingTasksDepth.fetch_sub(pendingTasks_.size(),
+                                                        std::memory_order_relaxed);
         pendingTasks_.clear();
     }
 
@@ -756,13 +757,13 @@ inline bool SubReactor::enqueue(std::function<void()> task) noexcept {
     {
         std::lock_guard<std::mutex> lk(pendingMutex_);
         if (!running_.load() || !server_->isRunning() || pendingTasks_.size() >= pendingTaskCap_) {
-            server_->statsRef().queueDrops.fetch_add(1);
+            server_->statsRef().queueDrops.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
         // Both batch vectors reserve this limit before the worker starts.
         pendingTasks_.emplace_back(std::move(task));
-        server_->statsRef().pendingTasksTotal.fetch_add(1);
-        server_->statsRef().pendingTasksDepth.fetch_add(1);
+        server_->statsRef().pendingTasksTotal.fetch_add(1, std::memory_order_relaxed);
+        server_->statsRef().pendingTasksDepth.fetch_add(1, std::memory_order_relaxed);
         // Serialize notification with stop's descriptor cleanup. No producer
         // touches wakeFd_ after releasing this lock.
         wakeup();
@@ -1563,7 +1564,8 @@ inline void SubReactor::loop() noexcept {
                                   readHead_ ? 0 : tickMs);
             if (n < 0) {
                 if (errno == EINTR) continue;
-                server_->statsRef().reactorFailures.fetch_add(1);
+                server_->statsRef().reactorFailures.fetch_add(1,
+                                                               std::memory_order_relaxed);
                 server_->fail();
                 break;
             }
@@ -1917,7 +1919,7 @@ inline void MultiReactorServer::acceptLoop(std::promise<bool>& ready) noexcept {
         int n = ::epoll_wait(epollFd_, events.data(), static_cast<int>(events.size()), 500);
         if (n < 0) {
             if (errno == EINTR) continue;
-            stats_.reactorFailures.fetch_add(1);
+            stats_.reactorFailures.fetch_add(1, std::memory_order_relaxed);
             fail();
             break;
         }
@@ -1998,13 +2000,13 @@ inline void MultiReactorServer::acceptLoop(std::promise<bool>& ready) noexcept {
                 }
                 } catch (...) {
                     // Before handoff, cfdGuard still owns the accepted socket.
-                    stats_.rejected.fetch_add(1);
+                    stats_.rejected.fetch_add(1, std::memory_order_relaxed);
                 }
             }
         }
     }
     } catch (...) {
-        stats_.reactorFailures.fetch_add(1);
+        stats_.reactorFailures.fetch_add(1, std::memory_order_relaxed);
         fail();
         try {
             ready.set_value(false);
