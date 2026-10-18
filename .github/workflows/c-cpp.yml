@@ -13,8 +13,9 @@
 # One thing this job does that no local run has managed: GitHub's runner has a
 # real kernel. send_results' hup/err case asks the host whether EPOLLHUP|EPOLLERR
 # are actually delivered and prints [SKIP] when they are not. On WSL they are
-# not -- an aborted connection arrives as an ordinary FIN -- so that case has sat
-# unexecuted through three review rounds. Here it should run.
+# not -- an aborted connection arrives as an ordinary FIN -- so that case sat
+# unexecuted through three review rounds. Here it runs and asserts. The last
+# step files the verdict, per configuration, where anyone can read it back.
 name: verify
 
 on:
@@ -31,7 +32,10 @@ jobs:
     timeout-minutes: 60
 
     steps:
-      - uses: actions/checkout@v4
+      # v5 rather than v4: v4 still runs on Node 20, which the runner now accepts
+      # only with a deprecation annotation against .github/workflows. That
+      # warning crowds out the ones this job is actually trying to file.
+      - uses: actions/checkout@v5
 
       # The script installs build-essential itself if g++ is missing; doing it
       # here keeps that branch from ever being taken, and hides its apt chatter.
@@ -57,14 +61,25 @@ jobs:
           set -o pipefail
           bash verify/run-in-wsl.sh 2>&1 | tee /tmp/verify-run.log
 
-      # A [SKIP] is not a pass, and the one worth reading here is hup/err: it
-      # asks the kernel whether EPOLLHUP|EPOLLERR are genuinely delivered, and
-      # every machine this project has been developed on answered no -- an
-      # aborted connection arrives as an ordinary FIN and the case declines to
-      # assert anything. Nothing in the exit code separates "asserted and
-      # passed" from "never ran", and the answer was left buried in a log nobody
-      # opens. Putting it in an annotation means it can be read back off the
-      # checks API without anyone signing into GitHub first.
+      # Three reasons this exists, and the second one is why the first version
+      # of it was not enough.
+      #
+      # 1. A [SKIP] changes no exit code. "asserted and passed" and "asked the
+      #    kernel and declined" leave the suite looking exactly alike, so the
+      #    truth about hup/err -- the one case that could never execute locally
+      #    -- stayed buried in a log nobody opens. An annotation can be read back
+      #    off the checks API by anyone, signed into GitHub or not.
+      # 2. A case is free to run under plain and decline under tsan. The first
+      #    version read only the first hup/err paragraph, so a skip in any later
+      #    configuration would have been reported as that first verdict -- the
+      #    same false comfort this step exists to remove, in a new place. It now
+      #    reports one verdict per configuration.
+      # 3. Anything else that declined gets named together with the pass it fell
+      #    in, because "1 case skipped" invites every reader to assume it was
+      #    not theirs.
+      #
+      # It stays a warning and not a failure on purpose: whether a kernel that
+      # declines is a kernel worth supporting is a judgement, not a CI policy.
       - name: what this kernel was willing to tell us
         if: always()
         run: |
@@ -73,17 +88,58 @@ jobs:
             echo "::warning title=skipped cases::the suite left no log to read"
             exit 0
           fi
-          n=$(grep -c '\[SKIP\]' "$log" || true)
-          echo "::notice title=skipped cases::$n case(s) declined to assert"
-          # The whole hup/err paragraph, up to the blank line that ends it --
-          # taking a fixed number of lines instead drags in the next case's
-          # heading and makes the message look like it says more than it does.
-          verdict=$(awk '/^hup\/err:/{f=1} f && NF==0 {exit} f' "$log" \
-                    | tr '\n' ' ' | tr -s ' ')
-          if [ -z "$verdict" ]; then
-            echo "::warning title=hup/err::no such line in the suite output"
-          elif printf '%s' "$verdict" | grep -q '\[SKIP\]'; then
-            echo "::warning title=hup/err skipped::$verdict"
+
+          # Every [SKIP] line with the pass it happened in. Each configuration
+          # announces itself with "---- running [title] ----", so whichever one
+          # was last seen owns every line after it.
+          report=$(
+              awk '
+                BEGIN { cfg="?" }
+                /^---- running \[/ {
+                    cfg=$0; sub(/^---- running \[/,"",cfg); sub(/\].*/,"",cfg)
+                }
+                /\[SKIP\]/ { line=$0; sub(/^[ \t]+/,"",line); print cfg ": " line }
+              ' "$log"
+          )
+          echo "::group::cases that declined to assert"
+          if [ -n "$report" ]; then printf '%s\n' "$report"; else echo "(none)"; fi
+          echo "::endgroup::"
+          while IFS= read -r line; do
+              [ -n "$line" ] &&
+                  printf '::notice title=case declined to assert::%s\n' "$line"
+          done <<< "$report"
+
+          # One hup/err verdict per configuration: the paragraph opening with its
+          # title, taken up to the blank line that closes it. A fixed number of
+          # lines instead drags in the next case's heading.
+          verdicts=$(
+              awk '
+                BEGIN { cfg="?" }
+                function flush() {
+                    if (f) printf "%s\t%s\n", (buf ~ /\[SKIP\]/ ? "skip" : "ran"), cfg
+                    f=0
+                }
+                /^---- running \[/ {
+                    flush()
+                    cfg=$0; sub(/^---- running \[/,"",cfg); sub(/\].*/,"",cfg)
+                    next
+                }
+                /^hup\/err:/ { f=1; buf=$0; next }
+                f && NF==0 { flush(); next }
+                f { buf = buf " " $0 }
+                END { flush() }
+              ' "$log"
+          )
+          if [ -z "$verdicts" ]; then
+              echo "::warning title=hup/err::no such case in the suite output"
+              exit 0
+          fi
+          ran=$(printf '%s\n' "$verdicts" | grep -c '^ran' || true)
+          skipped=$(printf '%s\n' "$verdicts" | grep -c '^skip' || true)
+          detail=$(printf '%s\n' "$verdicts" | tr '\t' '=' |
+                   paste -sd ';' - | sed 's/;/; /g')
+          if [ "$skipped" -eq 0 ]; then
+              echo "::notice title=hup/err ran in $ran configuration(s)::$detail"
           else
-            echo "::notice title=hup/err ran::$verdict"
+              echo "::warning title=hup/err skipped in $skipped of $((ran + skipped)) configuration(s)::$detail"
           fi
