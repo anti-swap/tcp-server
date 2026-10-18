@@ -1197,7 +1197,9 @@ inline bool SubReactor::tryBeginWriteShutdown(Conn* c) noexcept {
 //      the socket readable for the rest of its life, so with level-triggered
 //      read interest still armed every epoll_wait returns at once and the
 //      reactor busy-polls for the whole drain (measured: +35k FIN wakes in
-//      250ms). handleWrite resumes this once wbuf empties.
+//      250ms). handleWrite resumes this once wbuf empties. A park that cannot be
+//      registered is not a park -- the branch below ends the connection instead,
+//      because the only thing a half-registered park can do is spin.
 //   2. wbuf empty but pendingBytes > 0 -- replies are queued behind this batch.
 //      Defer exactly one queue round (waitingOnReplies) so they land in wbuf
 //      first; FIFO runs every task queued before this one first. At most once:
@@ -1220,12 +1222,35 @@ inline void SubReactor::finishPeerClosed(Conn* c) noexcept {
             struct epoll_event wev{};
             wev.events  = EPOLLOUT;
             wev.data.fd = c->fd;
-            if (epoll_ctl(epollFd_, EPOLL_CTL_MOD, c->fd, &wev) == 0)
+            if (epoll_ctl(epollFd_, EPOLL_CTL_MOD, c->fd, &wev) == 0) {
                 c->writeArmed = true;
-            else
-                server_->statsRef().epollCtlErrors.fetch_add(1,
-                    std::memory_order_relaxed);
-            // A failed MOD keeps EPOLLIN armed: the drain spins, nothing breaks.
+                return;                    // parked: handleWrite resumes it
+            }
+            if (errno == ENOENT) {
+                // Registered set out of sync, the same way armWrite can find it.
+                // Recovering with ADD is not optional here: ENOENT means the fd
+                // is in no interest list at all, so without this the socket goes
+                // silent and the drain never resumes -- a peer that comes back
+                // and reads gets what was already in flight and then hangs
+                // (measured: 3MB of 16MB, then nothing).
+                if (epoll_ctl(epollFd_, EPOLL_CTL_ADD, c->fd, &wev) == 0) {
+                    c->writeArmed = true;
+                    return;
+                }
+            }
+            // Any other failure: the interest list cannot be made to match what
+            // this connection needs, and EPOLLIN is still armed on a socket the
+            // peer has already FIN'd -- level-triggered, that is a read event on
+            // every single epoll_wait for as long as the drain takes, and every
+            // one of them re-runs recv() -> 0 -> this function -> the same
+            // failing call (measured: ~170k/s, one whole core, up to
+            // idleTimeoutMs + closeLingerMs, then a forced abort that drops
+            // everything still owed). Same verdict armWrite and disarmWrite
+            // already reach for the same syscall: end it, rather than let a
+            // connection that cannot be maintained be maintained anyway.
+            server_->statsRef().epollCtlErrors.fetch_add(1, std::memory_order_relaxed);
+            closeConn(c, "epoll park registration failed", false);
+            return;
         }
         return;                    // parked close finishes in handleWrite
     }
