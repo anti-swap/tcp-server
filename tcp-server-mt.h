@@ -246,6 +246,12 @@ struct ServerStats {
     // closeConnection() 发出去的 Submission 被队列拒绝的次数。这些关闭请求既
     // 没有落到连接上，也没有任何计数器记账，唯一的下场是等 idle 超时。
     std::atomic<uint64_t> closeRequestsDropped{0};
+    // sendmsg 返回 EPIPE 的次数：某个 socket 的写方向已经判死。至今每种能到达它的
+    // 路径都被别处的守卫先拦下了（本地 shutdown 之后 handleWrite 与 parkClose 的
+    // finSent 检查会先返回，对端 RST 则在 loop() 里先走 EPOLLERR/EPOLLHUP 分支），
+    // 所以它预期恒为 0——这个计数器的意义正是让"不可达"是可以被读出来的，而不是
+    // 永远只是一个判断。一旦它动了，说明上面的推理失效了，该回头复查这条路径。
+    std::atomic<uint64_t> epipeWrites{0};
 };
 
 // ==================== 发送结果 ====================
@@ -366,6 +372,19 @@ struct Conn {
     }
 };
 
+// How far a drain got. These used to be 0 / 1 / -1 with two different outcomes
+// sharing the 0: the while-loop ending because wbuf was empty, and EPIPE. The
+// first means every queued byte reached the kernel and the caller should go on
+// to whatever comes next; the second means not one more byte will ever leave,
+// and treating them alike is what put the connection's fate in the hands of
+// `wbuf.empty()` at each call site -- a fact none of them said out loud.
+enum class DrainOutcome {
+    Drained,   // wbuf is empty: everything owed has reached the kernel
+    Stalled,   // fair-share budget spent, or EAGAIN: EPOLLOUT will resume it
+    Dead,      // EPIPE: this socket's write direction is finished, permanently
+    Error,     // any other failure: fatal
+};
+
 // ==================== SubReactor ====================
 class SubReactor {
  public:
@@ -427,7 +446,7 @@ class SubReactor {
     void armWrite(Conn* c) noexcept;
     void disarmWrite(Conn* c) noexcept;
     void doTick() noexcept;
-    int  drainWbufToSocket(Conn* c) noexcept;
+    DrainOutcome drainWbufToSocket(Conn* c) noexcept;
     bool enqueue(std::function<void()> task) noexcept;
     void cleanup() noexcept;
     void scheduleRead(Conn* c) noexcept;
@@ -933,6 +952,9 @@ inline bool SubReactor::submitClose(uint64_t id) noexcept {
 }
 
 inline void SubReactor::armWrite(Conn* c) noexcept {
+    // Nothing asked for can ever leave a dead write side, and asking for it each
+    // time bytes arrive would spin this reactor on level-triggered EPOLLOUT for
+    // the rest of the connection's life.
     if (c->writeArmed || c->fd < 0) return;
     struct epoll_event ev{};
     ev.events = EPOLLIN | EPOLLOUT; ev.data.fd = c->fd;
@@ -960,7 +982,6 @@ inline void SubReactor::disarmWrite(Conn* c) noexcept {
     if (!c->writeArmed || c->fd < 0) return;
     // Still has bytes to flush: keep the interest instead of undoing a preceding
     // armWrite. The caller is responsible for retrying the drain.
-    if (!c->wbuf.empty()) return;
     struct epoll_event ev{};
     ev.events = EPOLLIN; ev.data.fd = c->fd;
     if (epoll_ctl(epollFd_, EPOLL_CTL_MOD, c->fd, &ev) < 0 && errno != ENOENT) {
@@ -971,10 +992,10 @@ inline void SubReactor::disarmWrite(Conn* c) noexcept {
     c->writeArmed = false;
 }
 
-inline int SubReactor::drainWbufToSocket(Conn* c) noexcept {
+inline DrainOutcome SubReactor::drainWbufToSocket(Conn* c) noexcept {
     size_t budget = server_->cfg_.writeBudgetBytes;
     while (!c->wbuf.empty()) {
-        if (!budget) return 1;
+        if (!budget) return DrainOutcome::Stalled;
         auto s = c->wbuf.spans();
         // Send both wrapped ring segments in one syscall, within the fair-share
         // byte budget. A larger configured budget trades latency for throughput.
@@ -989,14 +1010,17 @@ inline int SubReactor::drainWbufToSocket(Conn* c) noexcept {
         ssize_t k = ::sendmsg(c->fd, &msg, MSG_NOSIGNAL);
         if (k < 0) {
             if (errno == EINTR) continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK) return 1;
-            // EPIPE means the local write side is already shut down, so there is
-            // nothing left to deliver and nothing worth resetting: stop here and
-            // let the caller finish the half-close instead of escalating to RST.
-            if (errno == EPIPE) return 0;
-            return -1;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return DrainOutcome::Stalled;
+            // EPIPE: this socket will never take another byte. Returning is not
+            // the same thing as EAGAIN above, and the callers are the ones that
+            // have to know the difference -- see handleWrite and parkClose.
+            if (errno == EPIPE) {
+                server_->statsRef().epipeWrites.fetch_add(1, std::memory_order_relaxed);
+                return DrainOutcome::Dead;
+            }
+            return DrainOutcome::Error;
         }
-        if (k == 0) return -1;
+        if (k == 0) return DrainOutcome::Error;
         // Frame accounting runs before consume(): the readable region still
         // holds the bytes that just left, so a frame starting inside this
         // chunk still has its header there to read. A frame is counted when
@@ -1034,7 +1058,7 @@ inline int SubReactor::drainWbufToSocket(Conn* c) noexcept {
         server_->statsRef().bytesSent.fetch_add(static_cast<uint64_t>(k),
                                                   std::memory_order_relaxed);
     }
-    return 0;
+    return DrainOutcome::Drained;
 }
 
 // 读解析交错 + 每轮预算：防止单个客户端独占 reactor，也避免"rbuf 满含完整帧被误断"
@@ -1111,9 +1135,21 @@ inline void SubReactor::handleWrite(Conn* c) noexcept {
     if (c->finSent) {
         disarmWrite(c); return;
     }
-    int r = drainWbufToSocket(c);
-    if (r < 0) {
+    const DrainOutcome r = drainWbufToSocket(c);
+    if (r == DrainOutcome::Error) {
         closeConn(c, "send error", false); return;
+    }
+    // Nothing more will ever leave this socket, so there is nothing for the
+    // rest of this function to wait for: no FIN can be negotiated (it requires
+    // an empty wbuf first) and no later EPOLLOUT can deliver what is queued.
+    // Ending it here rather than waiting is also what keeps this from becoming
+    // the write-side echo of the busy-poll the read side was cured of -- a
+    // socket with send-buffer space and a broken peer reports EPOLLOUT on every
+    // single epoll_wait, and leaving the interest armed would have this reactor
+    // re-run a failing sendmsg until some outside deadline noticed.
+    if (r == DrainOutcome::Dead) {
+        closeConn(c, "write side dead", false);
+        return;
     }
     if (!c->wbuf.empty()) return;   // fair-share budget or EAGAIN: EPOLLOUT refires
 
@@ -1400,8 +1436,14 @@ inline void SubReactor::parkClose(Conn* c, const char* reason) noexcept {
     }
     // Hand over what is already queued; whatever does not fit in the socket
     // buffer stays in wbuf and is finished by handleWrite (EPOLLOUT armed).
-    int r = drainWbufToSocket(c);
-    if (r < 0) {
+    const DrainOutcome r = drainWbufToSocket(c);
+    if (r == DrainOutcome::Error) {
+        teardownClosed(c, reason, false); return;
+    }
+    // Once the socket refuses writes for good there is no graceful close left to
+    // honour -- nothing owed can leave, so no FIN can honestly follow it. Waiting
+    // would change nothing except which deadline does this same abort later.
+    if (r == DrainOutcome::Dead) {
         teardownClosed(c, reason, false); return;
     }
     if (!c->wbuf.empty()) {
