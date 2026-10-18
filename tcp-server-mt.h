@@ -1344,6 +1344,39 @@ inline void SubReactor::handleWrite(Conn* c) noexcept {
     // wbuf is empty, so anything owed to the peer has reached the kernel: this is
     // the only place a FIN may be sent. A non-closing connection just drops its
     // write interest here; a parked close turns into a half-close.
+    // Why this is not guarded by pendingBytes, even though it sends a FIN.
+    //
+    // "wbuf is empty" is not the same statement as "nothing is owed" -- a frame
+    // admitted by submitSend is counted in pendingBytes from the moment it is
+    // queued until it lands in wbuf, and this branch is exactly the one that
+    // reads wbuf without consulting that difference. So asking here whether
+    // anything is still reserved is the obvious question, and the answer for why
+    // it is not asked is an ordering invariant, which has to be written down or
+    // the next reader re-derives it and lands somewhere else:
+    //
+    // reply tasks only reach the queue from three places -- a handler (running in
+    // the read continuation or the event phase, both ahead of processPending()),
+    // another task, and a sendTo() from whatever thread the application used. The
+    // reactor sets `closing` from exactly three places too: a task
+    // (submitClose / drainInputThenClose's round), doTick()'s sweeps, and
+    // parkClose() called from this very branch. So:
+    //   - against a task: every reply enqueued before it is ahead of it in the
+    //     same FIFO batch, and processPending() drains the batch in order, so the
+    //     replies have landed by the time closing goes true;
+    //   - against doTick(): its sweeps run after processPending() in the same
+    //     iteration, so nothing a handler produced can still be pending;
+    //   - the rest of the money is made elsewhere: finishPeerClosed() above is
+    //     reached through the same guard N1 added, and handleWrite is reached
+    //     only through conns_, which is where closing comes from anyway.
+    //
+    // What remains is a submission that arrives between the queue drain and a
+    // sweep, from another task or another thread. That one really can be FIN'd
+    // over -- and it is the documented meaning of Ok ("queued, not delivered;
+    // shutdown or disconnection can discard work"), not a second meaning layered
+    // on top of it: submitSend's task refuses it and accounts it in queueDrops
+    // and bytesDropped, so a reply lost this way is countable rather than silent.
+    // Adding a guard here would move that accounting nowhere and would make every
+    // EPOLLOUT on a parked socket wait another iteration to ask again.
     disarmWrite(c);
     if (c->closing.load(std::memory_order_acquire) && !tryBeginWriteShutdown(c)) {
         // shutdown() failed on a socket that was writable a moment ago: the only
@@ -1584,6 +1617,14 @@ inline void SubReactor::unregisterConn(Conn* c, bool graceful) noexcept {
     ::close(c->fd);
     c->fd = -1;
     c->writeArmed = false;
+    // No reader observes this today, which is the point of saying so: every
+    // reader of `closing` is either iterating conns_ (so the connection is there)
+    // or checks isClosed first, and both callers reach this line with isClosed
+    // already true -- teardownClosed() sets it before unregistering, and
+    // discardRejectedConn() is erasing the connection as it goes. Clearing it
+    // does not un-park anything and nothing may rely on it having done so: what
+    // it buys is that a reader added later cannot find `closing` stale-true on a
+    // descriptor that is gone, which is a small mercy next to the alternative.
     c->closing.store(false, std::memory_order_release);
 }
 
