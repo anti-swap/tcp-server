@@ -490,6 +490,9 @@ class MultiReactorServer {
     struct Config {
         std::string bindAddr        = "0.0.0.0";
         uint16_t    port            = 0;
+        // Must be > 0 (start() refuses otherwise): Linux clamps listen()'s
+        // backlog only from above, so 0 would pass straight through as a
+        // zero-length accept queue -- connections refused under load, silently.
         int         backlog         = 1024;
         int         numReactors     = 0;
         int         maxConnections  = 10000;
@@ -1741,9 +1744,21 @@ inline bool MultiReactorServer::start() noexcept {
         cfg_.rbufCapacity < FRAME_HEADER_SIZE + MAX_FRAME_PAYLOAD ||
         cfg_.wbufCapacity < FRAME_HEADER_SIZE || cfg_.maxPendingBytes < FRAME_HEADER_SIZE ||
         cfg_.maxConnections <= 0 || cfg_.tickMs <= 0 || cfg_.idleTimeoutMs <= 0 ||
-        cfg_.writeBudgetBytes == 0 || cfg_.closeLingerMs <= 0) {
+        cfg_.writeBudgetBytes == 0 || cfg_.closeLingerMs <= 0 || cfg_.backlog <= 0) {
         life_.store(Life::Stopped, std::memory_order_release);
         return false;
+    }
+
+    // Deadline granularity: both timeouts only fire on tick boundaries, so a
+    // tick coarser than the deadline silently stretches it by up to a full
+    // tick. Warn rather than refuse -- a coarse tick with long deadlines is a
+    // legitimate choice; a coarse tick with a 200ms promise is a surprise.
+    if (cfg_.tickMs > cfg_.closeLingerMs || cfg_.tickMs > cfg_.idleTimeoutMs) {
+        std::fprintf(stderr,
+                     "[warn] tickMs=%d is coarser than closeLingerMs=%d / "
+                     "idleTimeoutMs=%d: both deadlines only fire on tick "
+                     "boundaries, so each can land up to a full tick late\n",
+                     cfg_.tickMs, cfg_.closeLingerMs, cfg_.idleTimeoutMs);
     }
 
     // 配置校验
