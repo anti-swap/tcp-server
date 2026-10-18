@@ -180,6 +180,11 @@ int setrlimit(int resource, const struct rlimit* rlp);
 typedef unsigned int useconds_t;
 extern "C" {
 int usleep(useconds_t usec);
+// Process spawning, for probes that run a scenario in a child so they can
+// report whether the child survived at all. Windows has neither; the shim only
+// has to make them compile, since verify/build.sh does not link.
+pid_t fork(void);
+void _exit(int status);
 }
 
 // unistd aliases the header needs

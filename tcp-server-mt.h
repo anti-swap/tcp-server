@@ -252,6 +252,10 @@ struct ServerStats {
     // 所以它预期恒为 0——这个计数器的意义正是让"不可达"是可以被读出来的，而不是
     // 永远只是一个判断。一旦它动了，说明上面的推理失效了，该回头复查这条路径。
     std::atomic<uint64_t> epipeWrites{0};
+    // 关闭回调被丢弃的次数：连接已经拆完了，但通知它的那次分配失败了。预期恒为 0
+    // （只有 bad_alloc 能到这里）；它存在的理由是"丢了一条通知"必须能被读出来——
+    // 否则唯一的症状是对端看到连接消失而回调从未被调用，且没有任何计数变化。
+    std::atomic<uint64_t> closeCallbacksDropped{0};
 };
 
 // ==================== 发送结果 ====================
@@ -403,6 +407,17 @@ enum class DrainOutcome {
     Error,     // any other failure: fatal
 };
 
+// One closed connection, held until its close callback has run. The Conn is
+// kept here on purpose: a deferred callback must not observe a connection that
+// has already been destroyed, and peer/reason are copied out because the
+// caller's `reason` is borrowed for that one call.
+struct ClosedConn {
+    std::shared_ptr<Conn> conn;
+    uint64_t              id     = 0;
+    std::string           peer;
+    std::string           reason;
+};
+
 // ==================== SubReactor ====================
 class SubReactor {
  public:
@@ -502,12 +517,12 @@ class SubReactor {
     std::vector<std::function<void()>> pendingTasks_;
     std::vector<std::function<void()>> activeTasks_;
 
-    // Deferred close notifications. Kept parallel and cleared together; entries
-    // are only touched by the worker thread.
-    std::vector<std::shared_ptr<Conn>> pendingCloses_;
-    std::vector<uint64_t>              pendingCloseIds_;
-    std::vector<std::string>           pendingClosePeers_;
-    std::vector<std::string>           pendingCloseReasons_;
+    // Deferred close notifications, one entry per closed connection. The four
+    // fields used to be four parallel vectors "cleared together so their indices
+    // always agree" -- which they did not, under the only condition that can
+    // fail here: inserting four things can succeed three times. An entry is now
+    // one object, so a partial notification is not representable.
+    std::vector<ClosedConn> pendingCloses_;
 
     std::unordered_map<int, Conn*>                      fdIndex_;
     std::unordered_map<uint64_t, std::shared_ptr<Conn>> conns_;
@@ -1658,15 +1673,30 @@ inline void SubReactor::teardownClosed(Conn* c, const char* reason, bool gracefu
     server_->onConnectionClosed(c->id);
     c->admission.reset();
 
-    // Queue the deferred notification. The Conn stays alive inside
-    // pendingCloses_ until flushCloseCallbacks() drops it, so a callback never
-    // observes a connection that has already been destroyed. peer/reason are
-    // copied out: `reason` is borrowed for this call only and must not outlive
-    // the caller's frame.
-    pendingCloses_.push_back(keepAlive);
-    pendingCloseIds_.push_back(c->id);
-    pendingClosePeers_.push_back(c->peer);
-    pendingCloseReasons_.push_back(reason ? reason : "");
+    // Queue the deferred notification: one entry, one insertion.
+    //
+    // This used to be four push_backs into four parallel vectors, and every
+    // function on that path is noexcept -- teardownClosed, closeConn, and
+    // everything that calls them. A bad_alloc on the second one left the first
+    // behind, so the next batch fed a callback the id of one connection with the
+    // peer string of another, and the exception itself terminated the process.
+    // On the close path, which is the one that gets walked when memory is tight.
+    //
+    // One object cannot be half-inserted. The catch is not about making the
+    // notification succeed -- the connection is already torn down and gone by
+    // here -- it is about not turning an allocation failure into a crash, and
+    // about the loss being countable rather than silent.
+    try {
+        ClosedConn entry;
+        entry.conn   = std::move(keepAlive);
+        entry.id     = c->id;
+        entry.peer   = c->peer;
+        entry.reason = reason ? reason : "";
+        pendingCloses_.push_back(std::move(entry));
+    } catch (...) {
+        server_->statsRef().closeCallbacksDropped.fetch_add(1,
+            std::memory_order_relaxed);
+    }
 }
 
 // Release our reference before running the callbacks: after this the connection
@@ -1677,27 +1707,20 @@ inline void SubReactor::finishClose(std::shared_ptr<Conn>& c) noexcept {
     c.reset();
 }
 
-// Runs the deferred ConnStateHandler(false) / CloseHandler pairs. The vectors are
+// Runs the deferred ConnStateHandler(false) / CloseHandler pairs. The batch is
 // swapped out first, so a callback that closes more connections (or enqueues
 // work) lands in a fresh batch instead of invalidating this loop.
-//
-// All four vectors are cleared together so their indices always agree.
 inline void SubReactor::flushCloseCallbacks() noexcept {
-    std::vector<std::shared_ptr<Conn>> live;
-    std::vector<uint64_t>    ids;
-    std::vector<std::string> peers;
-    std::vector<std::string> reasons;
-    live.swap(pendingCloses_);
-    ids.swap(pendingCloseIds_);
-    peers.swap(pendingClosePeers_);
-    reasons.swap(pendingCloseReasons_);
-    if (ids.empty()) return;
+    std::vector<ClosedConn> batch;
+    batch.swap(pendingCloses_);
+    if (batch.empty()) return;
 
-    for (size_t i = 0; i < ids.size(); ++i) {
-        if (i < live.size()) finishClose(live[i]);   // connection may die here
+    for (auto& e : batch) {
+        finishClose(e.conn);              // connection may die here
         auto& sh = server_->stateHandlerRef();
-        if (sh) sh(ids[i], peers[i], false);
-        if (server_->closeHandler_) server_->closeHandler_(ids[i], peers[i], reasons[i].c_str());
+        if (sh) sh(e.id, e.peer, false);
+        if (server_->closeHandler_)
+            server_->closeHandler_(e.id, e.peer, e.reason.c_str());
     }
 }
 
