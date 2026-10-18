@@ -146,6 +146,41 @@ class RingBuffer {
 
     size_t capacity()  const noexcept { return cap_; }
     size_t readable()  const noexcept { return size_; }
+
+    // Grows the ring to hold at least `need` bytes without passing `ceiling`,
+    // preserving what is readable. Returns false when that cannot be done -- at
+    // the ceiling, or the allocation failed -- so the caller keeps its existing
+    // refusal path instead of growing on a path that promises not to throw.
+    //
+    // This exists because the write buffer used to be allocated at its ceiling
+    // the moment a connection was accepted: 256KB of resident memory per
+    // connection, for a buffer most connections never fill. It now starts small
+    // (kInitialWbufBytes) and this is what makes the ceiling a ceiling rather
+    // than a size.
+    bool growTo(size_t need, size_t ceiling) noexcept {
+        if (need <= writable()) return true;
+        if (cap_ >= ceiling || ceiling < need) return false;
+        size_t target = cap_ ? cap_ : 1;
+        while (target < need) target = std::min(ceiling, target * 2);
+        std::vector<uint8_t> bigger;
+        try {
+            bigger.resize(target);
+        } catch (...) {
+            return false;
+        }
+        // The readable region may wrap, so it is two copies, and spans() is
+        // asked where the split is rather than re-deriving it: two places
+        // computing the same boundary is how they end up disagreeing.
+        const Spans s = spans();
+        std::memcpy(bigger.data(), s.p1, s.n1);
+        if (s.n2) std::memcpy(bigger.data() + s.n1, s.p2, s.n2);
+        buf_.swap(bigger);
+        cap_  = target;
+        head_ = 0;
+        size_ = s.n1 + s.n2;
+        return true;
+    }
+
     size_t writable()  const noexcept { return cap_ - size_; }
     bool   empty()     const noexcept { return size_ == 0; }
     bool   full()      const noexcept { return size_ == cap_; }
@@ -580,6 +615,14 @@ class SubReactor {
     // they were.
     static constexpr size_t kMinPendingTasks = 8192;
     size_t pendingTaskCap_ = kMinPendingTasks;
+
+    // How much write buffer a connection gets before it has anything to send.
+    // The ceiling stays Config::wbufCapacity; this is just no longer prepaid.
+    // 8KB holds a full 4KB MSS burst plus a frame header, so an ordinary reply
+    // never touches growTo(); a connection that pushes megabytes grows to the
+    // ceiling once and keeps it for its lifetime.
+    static constexpr size_t kInitialWbufBytes = 8 * 1024;
+
     std::mutex                        pendingMutex_;
     std::vector<std::function<void()>> pendingTasks_;
     std::vector<std::function<void()>> activeTasks_;
@@ -638,6 +681,10 @@ class MultiReactorServer {
         int         idleTimeoutMs   = 120000;
         int         tickMs          = 500;
         size_t      rbufCapacity    = FRAME_HEADER_SIZE + MAX_FRAME_PAYLOAD;
+        // Per-connection ceiling on buffered output, not the amount reserved
+        // when the connection is accepted: the ring starts at
+        // SubReactor::kInitialWbufBytes and grows up to this (RingBuffer::
+        // growTo). Read this as what a connection may cost, not what it does.
         size_t      wbufCapacity    = 256 * 1024;   // 256KB
         size_t      maxPendingBytes = 256 * 1024;   // <= wbufCapacity
         size_t      writeBudgetBytes = 256 * 1024;
@@ -1015,7 +1062,9 @@ inline bool SubReactor::submitNewConnection(
                 c->admission = std::move(admission);
                 c->lastRecvMs = nowMs();
                 c->rbuf.init(server_->rbufCapacity());
-                c->wbuf.init(server_->wbufCapacity());
+                // The ceiling, not the size: see kInitialWbufBytes and
+                // RingBuffer::growTo.
+                c->wbuf.init(std::min(kInitialWbufBytes, server_->wbufCapacity()));
 
                 struct epoll_event ev{};
                 ev.events = EPOLLIN; ev.data.fd = socket->fd;
@@ -1138,27 +1187,23 @@ inline bool SubReactor::submitSend(uint64_t id,
                 return;
             }
 
-            // Whole frames are written atomically: short capacity drops the
-            // frame
+            // Whole frames are written atomically: refusing drops the frame
             // rather than splitting it and corrupting the stream.
             //
-            // Reachable in principle, not in any configuration this file
-            // accepts:
-            // start() clamps maxPendingBytes down to wbufCapacity, a frame's
-            // reservation stays in pendingBytes until it is written, and wbuf's
-            // contents are a subset of what pendingBytes covers -- so
-            // wbuf.writable() >= f.size() holds here by construction. Measured
-            // under 8 concurrent producers, 38MB actually sent, to the point of
-            // 35369 refusals elsewhere: this branch fired 0 times.
+            // This used to be unreachable by construction -- wbuf was
+            // allocated at wbufCapacity(), and pendingBytes is clamped to it,
+            // so writable() >= f.size() always held (it fired 0 times in a
+            // measured 38MB run). Starting the buffer small makes "not enough
+            // room yet" the ordinary case instead of an impossibility, so the
+            // attempt to grow comes first: a frame that fits under the
+            // configured ceiling must not be dropped for want of a buffer the
+            // configuration already promised.
             //
-            // Kept rather than asserted away, because the alternative to
-            // refusing
-            // is a partial frame in wbuf, which corrupts the stream. It records
-            // both counters now, as the close branch above does: a refusal is
-            // one
-            // event that operations may want to read either way, and recording
-            // whichever one this branch reached is what made them incomparable.
-            if (c->wbuf.writable() < f.size()) {
+            // Growth can still fail -- already at the ceiling, or the
+            // allocation threw -- and then the refusal keeps its old meaning
+            // and its two counters, because a partial frame in wbuf corrupts
+            // the stream and a silent drop is worse than a counted one.
+            if (!c->wbuf.growTo(f.size(), server_->wbufCapacity())) {
                 c->pendingBytes.fetch_sub(f.size(), std::memory_order_relaxed);
                 server_->statsRef().bytesDropped.fetch_add(
                     f.size(), std::memory_order_relaxed);
@@ -1716,7 +1761,11 @@ inline void SubReactor::parseFrames(Conn* c, int& framesLeft) noexcept {
             if (!reserved) {
                 closeConn(c, "pending bytes at limit on pong", false); return;
             }
-            if (c->wbuf.writable() < pong.size()) {
+            // PONG is the frame header and nothing else, so with an 8KB
+            // starting buffer this never has to grow; it is written as a grow
+            // attempt rather than a capacity test so it cannot become a closed
+            // path if the starting size ever shrinks below a header.
+            if (!c->wbuf.growTo(pong.size(), server_->wbufCapacity())) {
                 c->pendingBytes.fetch_sub(
                     pong.size(), std::memory_order_relaxed);
                 closeConn(c, "wbuf full on pong", false); return;
