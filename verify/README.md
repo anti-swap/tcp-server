@@ -228,3 +228,33 @@ A/B 对照必须用两份都未插桩的构建——`loop_close_race.sh` 就是�
 
 可复用判据：判断"这条连接还欠字节吗"要看 `pendingBytes > 0`（已占额度、还没进 wbuf），
 而不是 `wbuf.empty()`。handler 的应答是 `submitSend` 排的任务，从不直写 wbuf。
+
+## 怎么给一个"不会发生的危险"做证据
+
+有些隐患今天不可达，所以没法写一个会失败的用例——但它们才是将来某次重构之后最贵的东西。
+两个已落地的处理办法：
+
+**（一）注入：把不变量打破，让危险变成真的。**
+
+`doTick` 的迭代安全原本依赖"若 `finSent` 则必 `closing`"这条跨 5 个函数、没有注释也没有断言的
+不变量。`verify/evidence/inject_fin_without_closing.py` 把 `finSent && !closing` 的状态直接摆到
+`doTick` 眼前——这正是任何一次只改了其中一处、漏了另一处的重构会造出来的样子。
+
+```
+bash verify/evidence/check_doTick_invariant.sh f27cfc1^
+   before  AddressSanitizer: heap-use-after-free   rc=1
+   after   accepted=24 closed=24 stillOpen=0       rc=0
+```
+
+两侧都注入，唯一变量是被测的 `doTick`。**必须显式给 before 参数**：默认 HEAD 的话，修复一落地
+脚本就在拿修复跟修复自己比较，还打印一个自信满满的结论。
+
+**（二）计数：让"不可达"保持可测量，而不是停留在判断。**
+
+`ServerStats::epipeWrites` 数 drain 撞上 EPIPE 的次数。目前五种"让对端带着未读数据消失"的构造
+（`verify/evidence/probe_epipe.cpp`：SO_LINGER 0、直接 close、带未读数据 close、先半关闭…）
+实测都是 0。这不等于不可达，只等于"没触发成功"——计数器的意义就是有朝一日它动起来时，能让那个
+差别被看见，而不是等到有人报告"连接不释放"。
+
+注意本机内核把 `SO_LINGER{on,0}` 变成 FIN 而不是 RST（`verify/evidence/so_linger_probe.cpp`），
+所以想在这里造真 RST 比看起来困难；`eofReads=1` 则说明五种场景里对端 FIN 都被正常识别，没有读自旋。
