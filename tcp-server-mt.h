@@ -983,13 +983,18 @@ inline void SubReactor::armWrite(Conn* c) noexcept {
 }
 
 inline void SubReactor::disarmWrite(Conn* c) noexcept {
-    // Targeted on the EPOLLOUT bit, not on an "armed" flag: after our FIN the
-    // write interest is gone but writeArmed is still true, and forgetting to
-    // clear EPOLLOUT there would make a half-closed connection spin on a
-    // level-triggered event it can never consume.
+    // Target state, not a toggle: the flag says what the EPOLLOUT bit should be,
+    // so the transition is skipped when the bit is already right and issued when
+    // it is not. The two are not the same question -- after our FIN the write
+    // interest is gone while writeArmed is still true, and skipping the MOD
+    // there would leave a half-closed connection spinning on a level-triggered
+    // event it can never consume.
     if (!c->writeArmed || c->fd < 0) return;
-    // Still has bytes to flush: keep the interest instead of undoing a preceding
-    // armWrite. The caller is responsible for retrying the drain.
+    // No "still has bytes to flush" guard belongs here: dropping the interest
+    // while wbuf holds bytes is exactly what strands them, and both callers
+    // (handleWrite, after the drain emptied wbuf, and the finSent path) have
+    // already established there is nothing left to write. Leaving it to the
+    // caller is what keeps this function a plain state transition.
     struct epoll_event ev{};
     ev.events = EPOLLIN; ev.data.fd = c->fd;
     if (epoll_ctl(epollFd_, EPOLL_CTL_MOD, c->fd, &ev) < 0 && errno != ENOENT) {
@@ -1260,6 +1265,11 @@ inline void SubReactor::finishPeerClosed(Conn* c) noexcept {
             closeConn(c, "epoll park registration failed", false);
             return;
         }
+        // fd < 0 means the descriptor is already detached, and the only place
+        // that detaches it is teardownClosed() -- which sets isClosed first, so
+        // the guard at the top of this function has already returned. Reaching
+        // here would mean a second detach path exists; the guard above is kept
+        // so that adding one cannot turn into a blind epoll_ctl on fd -1.
         return;                    // parked close finishes in handleWrite
     }
     if (!c->closing && !c->waitingOnReplies &&
